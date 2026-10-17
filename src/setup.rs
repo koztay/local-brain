@@ -273,9 +273,41 @@ fn choose_models_dir(need_gb: f64, yes: bool) -> Result<Option<PathBuf>> {
     let dir = v.mount.join("local-brain").join("ollama-models");
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating {} (is the drive writable?)", dir.display()))?;
+    check_models_dir(&dir)?;
     ok(&format!("models will be stored in {}", dir.display()));
     warn("keep this drive connected while you use local-brain; without it the local model is unavailable and local-brain falls back to deterministic mode.");
     Ok(Some(dir))
+}
+
+/// The models path ends up in a launchd plist, a systemd unit written with sudo, or `setx`.
+/// Accept only plain absolute paths without symlinks, so none of those can be subverted.
+fn check_models_dir(dir: &Path) -> Result<()> {
+    let s = dir.to_string_lossy();
+    if !dir.is_absolute() {
+        bail!("models directory must be an absolute path: {}", s);
+    }
+    // Backslash is the path separator on Windows, so it is only rejected elsewhere.
+    let unsafe_char = |c: &char| {
+        c.is_control()
+            || matches!(c, '"' | '%' | '$' | '`' | '\'')
+            || (*c == '\\' && !cfg!(windows))
+    };
+    if let Some(c) = s.chars().find(unsafe_char) {
+        bail!(
+            "the drive path {} contains {:?}, which cannot be used safely in a service definition; rename the drive or pick another one",
+            s,
+            c
+        );
+    }
+    let real = std::fs::canonicalize(dir).with_context(|| format!("resolving {}", s))?;
+    if real != dir {
+        bail!(
+            "{} resolves to {} through a symlink; pick the drive directly",
+            s,
+            real.display()
+        );
+    }
+    Ok(())
 }
 
 fn read_choice(n: usize, def: usize) -> usize {
@@ -410,23 +442,70 @@ fn install_macos_app() -> Result<()> {
         std::fs::create_dir_all(&d)?;
         d
     };
-    let zip = std::env::temp_dir().join("local-brain-Ollama-darwin.zip");
-    download(
-        "https://ollama.com/download/Ollama-darwin.zip",
-        &zip,
-        "Ollama",
-    )?;
-    // ditto keeps the code signature and extended attributes intact.
-    run(
-        "ditto",
-        &[
-            "-x",
-            "-k",
-            &zip.to_string_lossy(),
-            &dest_dir.to_string_lossy(),
-        ],
-    )?;
-    let _ = std::fs::remove_file(&zip);
+    let work = private_temp_dir()?;
+    let result = (|| -> Result<()> {
+        let zip = work.join("Ollama-darwin.zip");
+        download(
+            "https://ollama.com/download/Ollama-darwin.zip",
+            &zip,
+            "Ollama",
+        )?;
+        // ditto keeps the code signature and extended attributes intact.
+        let unpacked = work.join("unpacked");
+        run(
+            "ditto",
+            &[
+                "-x",
+                "-k",
+                &zip.to_string_lossy(),
+                &unpacked.to_string_lossy(),
+            ],
+        )?;
+        let app = unpacked.join("Ollama.app");
+        verify_macos_app(&app)?;
+        run(
+            "ditto",
+            &[
+                &app.to_string_lossy(),
+                &dest_dir.join("Ollama.app").to_string_lossy(),
+            ],
+        )
+    })();
+    let _ = std::fs::remove_dir_all(&work);
+    result
+}
+
+/// A fresh directory only this user can read, so nothing else can swap the download.
+fn private_temp_dir() -> Result<PathBuf> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let d = std::env::temp_dir().join(format!(
+        "local-brain-ollama-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    // create_dir (not create_dir_all) fails if the path already exists.
+    std::fs::create_dir(&d).with_context(|| format!("creating {}", d.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(d)
+}
+
+/// Refuse an Ollama.app whose signature is broken or that Gatekeeper would not run.
+fn verify_macos_app(app: &Path) -> Result<()> {
+    let a = app.to_string_lossy();
+    if !quiet_ok("codesign", &["--verify", "--deep", "--strict", &a]) {
+        bail!("the downloaded Ollama.app has an invalid code signature; not installing it");
+    }
+    if !quiet_ok("spctl", &["--assess", "--type", "execute", &a]) {
+        bail!("Gatekeeper rejected the downloaded Ollama.app; not installing it");
+    }
+    ok("verified the Ollama.app signature and notarization");
     Ok(())
 }
 
@@ -447,7 +526,11 @@ fn download(url: &str, to: &Path, label: &str) -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0.0);
     let mut reader = resp.into_reader();
-    let mut file = std::fs::File::create(to)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)
+        .with_context(|| format!("creating {}", to.display()))?;
     let mut buf = vec![0u8; 1 << 16];
     let mut done = 0f64;
     loop {
@@ -590,6 +673,7 @@ fn sh_quote(s: &str) -> String {
 
 /// Point the systemd `ollama` service at the chosen directory (the service runs as user ollama).
 fn linux_models_override(dir: &Path) -> Result<()> {
+    check_models_dir(dir)?;
     let d = sh_quote(&dir.to_string_lossy());
     let script = format!(
         "sudo mkdir -p {d} && sudo chown -R ollama:ollama {d} && \
@@ -760,6 +844,28 @@ mod tests {
         assert!(p.contains("<string>/opt/homebrew/bin/ollama</string><string>serve</string>"));
         let p = mac_agent_plist(Path::new("/x/ollama"), None, Path::new("/tmp/l"));
         assert!(!p.contains("OLLAMA_MODELS"));
+    }
+
+    #[test]
+    fn models_dir_validation() {
+        let tmp = std::env::temp_dir().canonicalize().unwrap();
+        let ok_dir = tmp.join(format!("lb-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&ok_dir).unwrap();
+        assert!(check_models_dir(&ok_dir).is_ok());
+        assert!(check_models_dir(Path::new("relative/dir")).is_err());
+        for bad in ["a\"b", "a$b", "a%b", "a\nb", "a'b"] {
+            let d = tmp.join(format!("lb-{}", bad));
+            assert!(check_models_dir(&d).is_err(), "{:?}", d);
+        }
+        #[cfg(unix)]
+        {
+            let link = tmp.join(format!("lb-link-{}", std::process::id()));
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&ok_dir, &link).unwrap();
+            assert!(check_models_dir(&link).is_err());
+            std::fs::remove_file(&link).unwrap();
+        }
+        std::fs::remove_dir_all(&ok_dir).unwrap();
     }
 
     #[test]
