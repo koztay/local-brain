@@ -121,8 +121,7 @@ brew install local-brain
 | Linux ARM64 | `local-brain-aarch64-unknown-linux-gnu.tar.gz` |
 | Windows x86_64 | `local-brain-x86_64-pc-windows-msvc.zip` |
 
-> On macOS the binaries are not notarized yet. The install script clears the quarantine flag for
-> you; after a manual download run `xattr -d com.apple.quarantine local-brain` once.
+> The macOS binaries are signed with a Developer ID certificate and notarized by Apple.
 
 **From source** (needs [Rust](https://rustup.rs) 1.80+ and a C compiler):
 
@@ -338,8 +337,8 @@ Differences from the original design, and what's next:
   repositories (up to ~100k chunks). An ANN index is planned for very large monorepos.
 * **Agents:** Claude Code today; the agent adapter layer is in place for Codex (phase 2).
 * **Distribution:** prebuilt binaries for macOS (arm64/x64), Linux (x64/arm64) and Windows (x64)
-  with SHA-256 checksums, install scripts and a Homebrew formula. Code signing / notarization and
-  inclusion in homebrew-core are planned.
+  with SHA-256 checksums, install scripts and a Homebrew formula; the macOS binaries are signed
+  and notarized. Windows code signing and inclusion in homebrew-core are planned.
 
 ## Troubleshooting
 

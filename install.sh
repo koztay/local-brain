@@ -58,7 +58,7 @@ try_release() {
   mkdir -p "$INSTALL_DIR"
   mv "$tmp/local-brain" "$INSTALL_DIR/local-brain"
   chmod +x "$INSTALL_DIR/local-brain"
-  # Downloaded binaries are not notarized; clear the quarantine flag so macOS runs it.
+  # Releases since v0.1.0 are notarized; clearing the quarantine flag is a harmless fallback.
   if [ "$os" = "Darwin" ] && command -v xattr >/dev/null 2>&1; then
     xattr -d com.apple.quarantine "$INSTALL_DIR/local-brain" 2>/dev/null || true
   fi
