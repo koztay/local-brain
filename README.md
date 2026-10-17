@@ -363,8 +363,10 @@ and deletes `~/.local-brain`. Then remove the binary: `brew uninstall local-brai
 1. Update the version in `Cargo.toml` and add a section to `CHANGELOG.md`.
 2. Push a tag (`git tag v0.2.0 && git push origin v0.2.0`) — or run the **Release** workflow
    manually from the Actions tab with the new tag name.
-3. The workflow builds all five platforms, publishes the release with `SHA256SUMS` and notes from
-   the changelog. Then update the URLs and checksums in `Formula/local-brain.rb`.
+3. The workflow builds all five platforms, signs and notarizes the macOS binaries (when the Apple
+   secrets are configured, see [docs/macos-signing.md](docs/macos-signing.md)), and publishes the
+   release with `SHA256SUMS` and notes from the changelog. Then update the URLs and checksums in
+   `Formula/local-brain.rb`.
 
 ## Contributing
 
