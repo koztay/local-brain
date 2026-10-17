@@ -202,7 +202,7 @@ A checklist to verify everything end to end (≈10 minutes):
 | Command | What it does |
 |---|---|
 | `local-brain init [path]` | Creates `.local-brain/`, registers the project, profiles hardware (first run), selects/downloads models, installs the Claude Code integration (MCP server, hooks, `CLAUDE.md` section). `--reconfigure`, `--provider`, `--no-agent`, `--no-models`, `--yes`. |
-| `local-brain learn` | Full incremental index: code graph, embeddings, summaries, documents, validation. Shows progress, resumes after interruption, then turns watching on. `--no-llm`, `--no-watch`. |
+| `local-brain learn` | Full incremental index in four steps (`[1/4]` code graph, embeddings, documents, summaries) with rate and ETA; resumes after interruption, then turns watching on. Model-written summaries are left to the background daemon so the index is usable immediately (`status` shows progress); `--no-watch` writes them in the foreground instead. `--no-llm`. |
 | `local-brain watch [on\|off]` | Add/remove the project from the background daemon. |
 | `local-brain status` | Index state, model tier, runtime, daemon RAM, last update, token savings. |
 | `local-brain ask "<question>"` | Ask the brain from the terminal (`--scope src/api`, `--no-llm`). |

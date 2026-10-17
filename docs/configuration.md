@@ -67,7 +67,7 @@ other commands above 2× that; read-like commands (`cat`, `head`, `git diff`, �
 | Key | Default | Meaning |
 |---|---|---|
 | `llm_summaries` | `true` | Use the local model for file/module/project summaries |
-| `max_llm_files` | `300` | Upper bound on LLM-summarized files (others get deterministic summaries) |
+| `max_llm_files` | `300` | How many files get model-written summaries: the most referenced code files first; the rest keep instant rule-based summaries |
 | `max_file_bytes` | `1000000` | Larger text files are skipped (documents may be 50× larger) |
 | `max_images` | `50` | Images described per `learn` run |
 | `embed_batch` | `32` | Embedding batch size |

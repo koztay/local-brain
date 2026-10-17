@@ -15,49 +15,135 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
+/// The step shown as `[n/total]` by progress bars of the current `learn` run.
+static STEP: std::sync::Mutex<Option<(usize, usize)>> = std::sync::Mutex::new(None);
+
+fn set_step(n: usize, total: usize) {
+    if let Ok(mut s) = STEP.lock() {
+        *s = Some((n, total));
+    }
+}
+
+/// `1m 05s`, `42s`, `1h 03m`.
+pub fn fmt_duration(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{}s", secs),
+        60..=3599 => format!("{}m {:02}s", secs / 60, secs % 60),
+        _ => format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60),
+    }
+}
+
+/// Seconds left at the average rate so far; `None` until there is enough to go on.
+fn eta_secs(done: usize, total: usize, elapsed: f64) -> Option<u64> {
+    if done == 0 || done >= total || (done < 3 && elapsed < 3.0) {
+        return None;
+    }
+    let secs = (elapsed / done as f64 * (total - done) as f64).round() as u64;
+    (secs > 0).then_some(secs)
+}
+
 pub struct Progress {
     label: String,
     total: usize,
     done: usize,
     enabled: bool,
+    step: Option<(usize, usize)>,
+    started: std::time::Instant,
+    last_draw: Option<std::time::Instant>,
 }
 
 impl Progress {
+    /// A progress line on stderr. Animated only on a terminal; otherwise one line at the end.
     pub fn new(label: &str, total: usize, enabled: bool) -> Progress {
-        let p = Progress {
+        let mut p = Progress {
             label: label.to_string(),
             total,
             done: 0,
             enabled,
+            step: STEP.lock().ok().and_then(|s| *s),
+            started: std::time::Instant::now(),
+            last_draw: None,
         };
-        p.draw();
+        if total == 0 && enabled && p.step.is_some() {
+            // Keep the step sequence readable when a step has nothing to do.
+            let step = p
+                .step
+                .map(|(n, t)| format!("[{}/{}] ", n, t))
+                .unwrap_or_default();
+            eprintln!("  {}{:<11} up to date", step, p.label);
+        }
+        p.draw(false);
         p
     }
     pub fn inc(&mut self) {
         self.done += 1;
-        if self.done == self.total || self.done % 5 == 0 || self.total < 100 {
-            self.draw();
+        let due = self
+            .last_draw
+            .map(|t| t.elapsed().as_millis() >= 200)
+            .unwrap_or(true);
+        if due || self.done == self.total {
+            self.draw(false);
         }
     }
-    fn draw(&self) {
-        if !self.enabled || self.total == 0 {
-            return;
-        }
-        let width = 28;
+    fn line(&self, finished: bool) -> String {
+        let width = 24;
         let filled = (self.done * width) / self.total.max(1);
-        eprint!(
-            "\r  {:<12} [{}{}] {}/{}   ",
+        let step = self
+            .step
+            .map(|(n, t)| format!("[{}/{}] ", n, t))
+            .unwrap_or_default();
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let tail = if finished {
+            format!("done in {}", fmt_duration(elapsed.round() as u64))
+        } else {
+            let rate = if elapsed >= 1.0 && self.done > 0 {
+                let r = self.done as f64 / elapsed;
+                if r >= 1.0 {
+                    format!("{:.0}/s", r)
+                } else {
+                    format!("{:.1}s each", 1.0 / r)
+                }
+            } else {
+                String::new()
+            };
+            match eta_secs(self.done, self.total, elapsed) {
+                Some(e) => format!("{} · ETA {}", rate, fmt_duration(e)),
+                None => rate,
+            }
+        };
+        format!(
+            "  {}{:<11} [{}{}] {}/{}  {}",
+            step,
             self.label,
             "█".repeat(filled),
             "░".repeat(width - filled),
             self.done,
-            self.total
-        );
+            self.total,
+            tail
+        )
+    }
+    fn tty() -> bool {
+        use std::io::IsTerminal;
+        std::io::stderr().is_terminal()
+    }
+    fn draw(&mut self, finished: bool) {
+        if !self.enabled || self.total == 0 || !Self::tty() {
+            return;
+        }
+        self.last_draw = Some(std::time::Instant::now());
+        // \x1b[K clears what a longer previous line left behind.
+        eprint!("\r{}\x1b[K", self.line(finished));
         let _ = std::io::stderr().flush();
     }
-    pub fn finish(&self) {
-        if self.enabled && self.total > 0 {
+    pub fn finish(&mut self) {
+        if !self.enabled || self.total == 0 {
+            return;
+        }
+        if Self::tty() {
+            self.draw(true);
             eprintln!();
+        } else {
+            eprintln!("{}", self.line(true));
         }
     }
 }
@@ -74,6 +160,8 @@ pub struct Report {
     pub embed_model: String,
     pub summaries: usize,
     pub llm_summaries: usize,
+    /// Model summaries left for the background (time budget reached).
+    pub summaries_pending: usize,
     pub flagged: usize,
     pub docs: usize,
     pub archived_memories: usize,
@@ -87,6 +175,8 @@ pub struct Options {
     /// Only the AST + lexical index (what the watcher does synchronously).
     pub ast_only: bool,
     pub quiet: bool,
+    /// Time allowed for model summaries; `None` = no limit. The rest is left for later passes.
+    pub summary_budget: Option<std::time::Duration>,
 }
 
 /// Index one file's structure and chunks (stage 1). Returns true if anything changed.
@@ -594,7 +684,9 @@ pub fn learn(project: &Project, cfg: &Config, opts: Options) -> Result<Report> {
         }
     }
 
+    let steps = if opts.ast_only { 2 } else { 4 };
     // 2. AST graph + chunks (deterministic, no LLM).
+    set_step(1, steps);
     let mut prog = Progress::new("code graph", entries.len(), !quiet);
     for e in &entries {
         match index_file(&store, project, e) {
@@ -614,6 +706,7 @@ pub fn learn(project: &Project, cfg: &Config, opts: Options) -> Result<Report> {
     } else {
         Embedder::new(cfg, &llm.rt)
     };
+    set_step(2, steps);
     let embed_result = embed_pending(&store, &embedder, cfg.learn.embed_batch, quiet);
     match embed_result {
         Ok(n) => rep.embedded = n,
@@ -630,6 +723,7 @@ pub fn learn(project: &Project, cfg: &Config, opts: Options) -> Result<Report> {
 
     if !opts.ast_only {
         // 4. Documents (images/PDFs → text, locally).
+        set_step(3, steps);
         rep.docs = crate::docs::learn_docs(
             &store,
             project,
@@ -648,10 +742,21 @@ pub fn learn(project: &Project, cfg: &Config, opts: Options) -> Result<Report> {
         );
 
         // 5 + 6. Bottom-up summaries with symbol validation.
-        let s = crate::summarize::summarize_all(&store, project, cfg, &llm, opts.no_llm, quiet)?;
-        rep.summaries = s.0;
-        rep.llm_summaries = s.1;
-        rep.flagged = s.2;
+        set_step(4, steps);
+        let s = crate::summarize::summarize_all(
+            &store,
+            project,
+            cfg,
+            &llm,
+            opts.no_llm,
+            quiet,
+            opts.summary_budget,
+        )?;
+        rep.summaries = s.written;
+        rep.llm_summaries = s.via_llm;
+        rep.flagged = s.flagged;
+        rep.summaries_pending = s.pending;
+        store.set_meta("summaries_pending", &s.pending.to_string())?;
 
         // Archive memories whose files no longer exist.
         rep.archived_memories = crate::memory::archive_orphans(&store, project)?;
@@ -664,6 +769,9 @@ pub fn learn(project: &Project, cfg: &Config, opts: Options) -> Result<Report> {
     rep.symbols = store.count("SELECT count(*) FROM symbols");
     rep.edges = store.count("SELECT count(*) FROM edges");
     rep.chunks = store.count("SELECT count(*) FROM chunks");
+    if let Ok(mut s) = STEP.lock() {
+        *s = None;
+    }
     store.set_meta("last_learn", &util::now().to_string())?;
     if let Some(head) = git_head(&project.root) {
         store.set_meta("git_head", &head)?;
@@ -765,5 +873,27 @@ mod tests {
         let c = chunk_text(t);
         assert_eq!(c.len(), 2);
         assert_eq!(c[1].0.as_deref(), Some("B"));
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn durations_read_naturally() {
+        assert_eq!(fmt_duration(0), "0s");
+        assert_eq!(fmt_duration(42), "42s");
+        assert_eq!(fmt_duration(65), "1m 05s");
+        assert_eq!(fmt_duration(3780), "1h 03m");
+    }
+
+    #[test]
+    fn eta_waits_for_data_then_extrapolates() {
+        assert_eq!(eta_secs(0, 100, 10.0), None);
+        assert_eq!(eta_secs(1, 100, 0.5), None);
+        assert_eq!(eta_secs(100, 100, 50.0), None);
+        // 10 done in 20 s → 2 s each → 90 left ≈ 180 s.
+        assert_eq!(eta_secs(10, 100, 20.0), Some(180));
     }
 }

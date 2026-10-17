@@ -290,13 +290,17 @@ fn llm_file_summary(
     tier: &str,
     strict: Option<&HashSet<String>>,
 ) -> Result<String> {
+    // Prompt and answer sizes drive the cost: on a small model each 100 prompt tokens cost
+    // ~0.25 s and each answer token ~30 ms, so tier S keeps both tight.
+    let small = tier == "S";
     let skeleton = crate::slice::skeleton(store, project, &f.path)?;
+    let (skeleton, _) = util::clip_tokens(&skeleton, if small { 400 } else { 700 });
     let src = std::fs::read_to_string(project.abs(&f.path)).unwrap_or_default();
-    let (src, _) = util::clip_tokens(&src, if tier == "S" { 1200 } else { 2000 });
-    let length = if tier == "S" {
-        "1-2 sentences"
+    let (src, _) = util::clip_tokens(&src, if small { 600 } else { 1500 });
+    let length = if small {
+        "1-2 sentences (at most 45 words)"
     } else {
-        "2-3 sentences"
+        "2-3 sentences (at most 70 words)"
     };
     let mut prompt = format!(
         "Summarize this source file for a developer who has not seen it, in {length}. \
@@ -314,11 +318,37 @@ fn llm_file_summary(
             list.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
         ));
     }
-    let out = llm.code(&prompt, 220)?;
+    let out = llm.code(&prompt, if small { 90 } else { 160 })?;
     Ok(out.trim().to_string())
 }
 
-/// Summarize everything that is missing or stale. Returns (summaries written, via LLM, flagged).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SummaryStats {
+    pub written: usize,
+    pub via_llm: usize,
+    pub flagged: usize,
+    /// Model summaries still to do because the time budget ran out.
+    pub pending: usize,
+}
+
+/// How many files reference each file (resolved imports and calls): a cheap importance rank.
+fn incoming_refs(store: &Store) -> HashMap<i64, i64> {
+    let mut out = HashMap::new();
+    if let Ok(mut st) = store.conn.prepare(
+        "SELECT resolved_file_id, count(DISTINCT file_id) FROM edges \
+         WHERE resolved_file_id IS NOT NULL AND resolved_file_id != file_id GROUP BY 1",
+    ) {
+        if let Ok(rows) = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))) {
+            out.extend(rows.flatten());
+        }
+    }
+    out
+}
+
+/// Summarize everything that is missing or stale. Model summaries go to the `max_llm_files`
+/// most referenced code files only; the rest keep instant rule-based summaries. With a
+/// `budget`, model work stops when it runs out and the remainder is reported as `pending`
+/// (rule-based summaries stand in until a later pass upgrades them).
 pub fn summarize_all(
     store: &Store,
     project: &Project,
@@ -326,34 +356,71 @@ pub fn summarize_all(
     llm: &Llm,
     no_llm: bool,
     quiet: bool,
-) -> Result<(usize, usize, usize)> {
+    budget: Option<std::time::Duration>,
+) -> Result<SummaryStats> {
     let use_llm = !no_llm && cfg.learn.llm_summaries && llm.has_text();
+    let deadline = budget.map(|b| std::time::Instant::now() + b);
+    let in_budget = || {
+        deadline
+            .map(|d| std::time::Instant::now() < d)
+            .unwrap_or(true)
+    };
     let tier = cfg.models.tier.clone();
     let known = known_names(store)?;
     let files = store.files()?;
     let mut written = 0;
-    // The LLM budget is per run, so changed files keep getting model summaries.
     let mut via_llm = 0usize;
     let mut flagged = 0;
+    let mut pending = 0usize;
 
-    let todo: Vec<&FileRow> = files
+    let refs = incoming_refs(store);
+    let importance = |f: &FileRow| refs.get(&f.id).copied().unwrap_or(0);
+    let mut ranked: Vec<&FileRow> = files
+        .iter()
+        .filter(|f| f.kind == "code" && f.lines <= 2000)
+        .collect();
+    ranked.sort_by_key(|f| (std::cmp::Reverse(importance(f)), f.path.clone()));
+    let eligible: HashSet<i64> = ranked
+        .iter()
+        .take(if use_llm { cfg.learn.max_llm_files } else { 0 })
+        .map(|f| f.id)
+        .collect();
+
+    let mut todo: Vec<&FileRow> = files
         .iter()
         .filter(|f| f.kind != "doc")
         .filter(|f| match store.summary("file", &f.path) {
             Ok(Some((_, stale, flagged, h))) => {
                 stale || h != f.hash || f.stage < 3
-                    // Upgrade rule-based summaries once a model is available.
-                    || (use_llm && f.kind == "code" && !flagged && store.summary_model("file", &f.path).ok().flatten().as_deref() == Some("rules"))
+                    // Upgrade rule-based summaries of important files once a model is available.
+                    || (eligible.contains(&f.id) && !flagged && store.summary_model("file", &f.path).ok().flatten().as_deref() == Some("rules"))
             }
             _ => true,
         })
         .collect();
+    // Most important first, so a limited budget is spent where it helps most.
+    todo.sort_by_key(|f| {
+        (
+            !eligible.contains(&f.id),
+            std::cmp::Reverse(importance(f)),
+            f.path.clone(),
+        )
+    });
     let mut prog = Progress::new("summaries", todo.len(), !quiet);
     for f in todo {
         let mut text = None;
         let mut model = "rules".to_string();
         let mut flag = false;
-        if use_llm && via_llm < cfg.learn.max_llm_files && f.lines <= 2000 && f.kind == "code" {
+        if eligible.contains(&f.id) && !in_budget() {
+            pending += 1;
+            // Keep a current rule-based summary as it is; write one if there is none yet.
+            if let Ok(Some((_, false, _, h))) = store.summary("file", &f.path) {
+                if h == f.hash && f.stage >= 3 {
+                    prog.inc();
+                    continue;
+                }
+            }
+        } else if eligible.contains(&f.id) {
             match llm_file_summary(llm, project, store, f, &tier, None) {
                 Ok(s) if looks_like_summary(&s) => {
                     let (total, unknown) = unknown_names(&s, &known);
@@ -429,8 +496,15 @@ pub fn summarize_all(
             .collect();
         hasher_input.sort();
         let h = util::sha256_hex(hasher_input.join("\n").as_bytes());
+        let module_eligible = use_llm && fs.len() >= 2;
         if let Ok(Some((_, stale, _, old))) = store.summary("module", key) {
-            if !stale && old == h {
+            let rules =
+                store.summary_model("module", key).ok().flatten().as_deref() == Some("rules");
+            if !stale && old == h && !(module_eligible && rules) {
+                continue;
+            }
+            if !stale && old == h && !in_budget() {
+                pending += 1;
                 continue;
             }
         }
@@ -480,13 +554,16 @@ pub fn summarize_all(
         );
         let mut text = heuristic.clone();
         let mut model = "rules".to_string();
-        if use_llm && module_llm < 60 && fs.len() >= 2 && !lines.is_empty() {
+        if module_eligible && module_llm < 60 && !lines.is_empty() && !in_budget() {
+            pending += 1;
+        } else if module_eligible && module_llm < 60 && !lines.is_empty() {
             let prompt = format!(
                 "Describe the purpose of {} in 2-3 sentences, based on these summaries of its files and subdirectories. Mention only names that appear below. No preamble.\n\n{}",
                 if key == "." { "the project's root directory".to_string() } else { format!("the project directory `{}/`", key) },
                 lines.join("\n")
             );
-            if let Ok(s) = llm.text(&prompt, 200) {
+            let max = if tier == "S" { 120 } else { 200 };
+            if let Ok(s) = llm.text(&prompt, max) {
                 let (t, u) = unknown_names(&s, &known);
                 if looks_like_summary(&s) && !is_suspicious(t, &u) {
                     text = format!("{}\n{}", s.trim(), heuristic);
@@ -514,8 +591,14 @@ pub fn summarize_all(
         store.put_summary("architecture", ".", &arch, &arch_hash, false, "rules")?;
         written += 1;
     }
-    let proj_fresh =
-        matches!(store.summary("project", "."), Ok(Some((_, false, _, ref h))) if *h == arch_hash);
+    let proj_rules = store
+        .summary_model("project", ".")
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("rules");
+    let proj_fresh = matches!(store.summary("project", "."), Ok(Some((_, false, _, ref h))) if *h == arch_hash)
+        && !(use_llm && proj_rules && in_budget());
     if !proj_fresh {
         let readme = ["README.md", "readme.md", "README", "README.rst"]
             .iter()
@@ -533,7 +616,9 @@ pub fn summarize_all(
         #[allow(unused_mut)]
         let mut text = heuristic_project_summary(store, &files, &readme_intro)?;
         let mut model = "rules".to_string();
-        if use_llm {
+        if use_llm && !in_budget() {
+            pending += 1;
+        } else if use_llm {
             let prompt = format!(
                 "Write a 3-5 sentence overview of this software project for a new contributor: what it does, how it is organized, and where to start reading. Use only names that appear below. No preamble.\n\nREADME excerpt:\n{}\n\nTop-level structure:\n{}\n\nArchitecture:\n{}",
                 util::clip(&readme, 2500),
@@ -551,7 +636,12 @@ pub fn summarize_all(
         store.put_summary("project", ".", &text, &arch_hash, false, &model)?;
         written += 1;
     }
-    Ok((written, via_llm, flagged))
+    Ok(SummaryStats {
+        written,
+        via_llm,
+        flagged,
+        pending,
+    })
 }
 
 /// Deterministic overview: README intro, languages, and the most depended-upon files.

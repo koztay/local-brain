@@ -295,6 +295,16 @@ pub fn init(opts: InitOptions) -> Result<()> {
     Ok(())
 }
 
+/// Session briefings add context instead of replacing output, so their "saving" is negative;
+/// say so instead of printing a minus sign.
+fn saved_label(saved: i64) -> String {
+    if saved >= 0 {
+        format!("saved ~{}", util::human_tokens(saved))
+    } else {
+        format!("adds ~{} tokens of context", util::human_tokens(-saved))
+    }
+}
+
 pub fn learn(path: Option<&Path>, no_llm: bool, no_watch: bool) -> Result<()> {
     let project = paths::resolve_project(path)?;
     let cfg = Config::load(Some(&project));
@@ -312,6 +322,9 @@ pub fn learn(path: Option<&Path>, no_llm: bool, no_watch: bool) -> Result<()> {
         &cfg,
         crate::learn::Options {
             no_llm,
+            // With watching on, the daemon writes model summaries in the background, so the
+            // index is usable right away; without it they are written here.
+            summary_budget: (!no_watch).then_some(std::time::Duration::ZERO),
             ..Default::default()
         },
     )?;
@@ -332,6 +345,12 @@ pub fn learn(path: Option<&Path>, no_llm: bool, no_watch: bool) -> Result<()> {
         "{} summaries written ({} by the local model, {} flagged by validation)",
         rep.summaries, rep.llm_summaries, rep.flagged
     ));
+    if rep.summaries_pending > 0 {
+        ok(&format!(
+            "{} model summaries will be written in the background (`local-brain status` shows progress)",
+            rep.summaries_pending
+        ));
+    }
     if rep.docs > 0 {
         ok(&format!("{} documents read locally", rep.docs));
     }
@@ -347,7 +366,10 @@ pub fn learn(path: Option<&Path>, no_llm: bool, no_watch: bool) -> Result<()> {
     if rep.warnings.len() > 10 {
         warn(&format!("… {} more warnings", rep.warnings.len() - 10));
     }
-    eprintln!("  done in {:.1}s", t0.elapsed().as_secs_f64());
+    eprintln!(
+        "  done in {}",
+        crate::learn::fmt_duration(t0.elapsed().as_secs_f64().round() as u64)
+    );
     if !no_watch {
         registry::set_watch(&project.root, true)?;
         match daemon::start() {
@@ -434,9 +456,19 @@ pub fn status(path: Option<&Path>) -> Result<()> {
         store.count("SELECT count(*) FROM docs"),
         last.map(util::fmt_ts).unwrap_or_else(|| "never".into())
     );
+    let pending: i64 = store
+        .meta("summaries_pending")?
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     println!(
-        "Summaries {} ({} stale, {} flagged) · embeddings: {}",
+        "Summaries {} ({} by model{}, {} stale, {} flagged) · embeddings: {}",
         store.count("SELECT count(*) FROM summaries"),
+        store.count("SELECT count(*) FROM summaries WHERE model != 'rules'"),
+        if pending > 0 {
+            format!(", {} more being written in the background", pending)
+        } else {
+            String::new()
+        },
         store.count("SELECT count(*) FROM summaries WHERE stale = 1"),
         store.count("SELECT count(*) FROM summaries WHERE flagged = 1"),
         store.meta("embed_model")?.unwrap_or_else(|| "-".into())
@@ -457,26 +489,26 @@ pub fn status(path: Option<&Path>) -> Result<()> {
     for (label, since) in [("today", util::today_start()), ("all time", 0)] {
         let (calls, base, act) = store.metric_totals(since)?;
         let saved = base - act;
+        let pct = if base > 0 && saved > 0 {
+            format!(" ({:.0}%)", 100.0 * saved as f64 / base as f64)
+        } else {
+            String::new()
+        };
         println!(
-            "Savings   {:<8} {} calls · Claude would have seen ~{} tokens, saw {} · saved ~{} ({:.0}%)",
+            "Savings   {:<8} {} calls · Claude would have seen ~{} tokens, saw {} · {}{}",
             label,
             calls,
             util::human_tokens(base),
             util::human_tokens(act),
-            util::human_tokens(saved),
-            if base > 0 { 100.0 * saved as f64 / base as f64 } else { 0.0 }
+            saved_label(saved),
+            pct
         );
     }
     let br = store.metric_breakdown(0)?;
     if !br.is_empty() {
         println!("By source:");
         for (kind, n, b, a) in br {
-            println!(
-                "  {:<15} {:>5} calls · saved ~{}",
-                kind,
-                n,
-                util::human_tokens(b - a)
-            );
+            println!("  {:<15} {:>5} calls · {}", kind, n, saved_label(b - a));
         }
     }
     Ok(())

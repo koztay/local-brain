@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.3] - 2026-10-17
+
+### Changed
+- `learn` shows each step as `[n/4]` with rate, ETA and duration, and prints "up to date" for
+  steps with nothing to do. Off a terminal it prints one line per step instead of redrawing.
+- `learn` no longer waits for model-written summaries when watching is on: it finishes with
+  rule-based summaries and the daemon upgrades them in 30-second background passes, so file
+  watching stays responsive. `status` shows how many are still pending. `--no-watch` keeps the
+  old foreground behaviour.
+- Model summaries go to the most referenced files first and stay within `max_llm_files` (other
+  files keep rule-based summaries instead of being upgraded on every pass).
+- Smaller prompts and answers on tier S (outline ≤ 400 tokens, source ≤ 600, answer ≤ 90):
+  measured on gemma3:4b / Apple M4, ~5–7 s per file summary instead of ~10 s.
+
+### Fixed
+- The daemon's start-up catch-up pass only ran after the first file change; it now runs for
+  every watched project.
+- `status` no longer prints negative savings for session briefings ("adds ~N tokens of context").
+
 ## [0.1.2] - 2026-10-17
 
 ### Fixed

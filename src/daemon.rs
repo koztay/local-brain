@@ -127,6 +127,18 @@ struct ProjState {
     full_reindex: bool,
 }
 
+impl ProjState {
+    fn new() -> Self {
+        ProjState {
+            pending: HashSet::new(),
+            last_event: Instant::now(),
+            // Catch up once after start: model summaries `learn` left for the background.
+            dirty_since: Some(Instant::now()),
+            full_reindex: false,
+        }
+    }
+}
+
 /// Run the daemon in the foreground.
 pub fn run() -> Result<()> {
     paths::ensure_home()?;
@@ -173,6 +185,9 @@ pub fn run() -> Result<()> {
                                 root.display()
                             );
                             watched.insert(root.clone(), ());
+                            // Create the state now, not on the first file event, so the
+                            // start-up catch-up pass runs even when nothing is being edited.
+                            states.entry(root.clone()).or_insert_with(ProjState::new);
                         }
                         Err(e) => eprintln!("watch {}: {}", root.display(), e),
                     }
@@ -219,12 +234,7 @@ pub fn run() -> Result<()> {
                 else {
                     continue;
                 };
-                let st = states.entry(root).or_insert_with(|| ProjState {
-                    pending: HashSet::new(),
-                    last_event: Instant::now(),
-                    dirty_since: None,
-                    full_reindex: false,
-                });
+                let st = states.entry(root).or_insert_with(ProjState::new);
                 if p.ends_with(".git/HEAD") {
                     st.full_reindex = true;
                 } else {
@@ -259,6 +269,7 @@ pub fn run() -> Result<()> {
                             ast_only: true,
                             quiet: true,
                             no_llm: true,
+                            summary_budget: None,
                         },
                     )
                     .map(|r| r.indexed)
@@ -298,16 +309,29 @@ pub fn run() -> Result<()> {
                         &cfg,
                         crate::learn::Options {
                             quiet: true,
+                            // Short passes keep file watching responsive between them.
+                            summary_budget: Some(Duration::from_secs(30)),
                             ..Default::default()
                         },
                     ) {
-                        Ok(r) => eprintln!(
-                            "[{}] {}: background refresh ({} summaries, {} embeddings)",
-                            util::fmt_ts(util::now()),
-                            root.display(),
-                            r.summaries,
-                            r.embedded
-                        ),
+                        Ok(r) => {
+                            if r.summaries + r.embedded > 0 || r.summaries_pending > 0 {
+                                eprintln!(
+                                    "[{}] {}: background refresh ({} summaries, {} by model, {} embeddings, {} pending)",
+                                    util::fmt_ts(util::now()),
+                                    root.display(),
+                                    r.summaries,
+                                    r.llm_summaries,
+                                    r.embedded,
+                                    r.summaries_pending
+                                );
+                            }
+                            if r.summaries_pending > 0 {
+                                // More to do: run the next pass as soon as things are quiet.
+                                st.dirty_since =
+                                    Instant::now().checked_sub(Duration::from_secs(45));
+                            }
+                        }
                         Err(e) => eprintln!(
                             "[{}] {}: background refresh failed: {:#}",
                             util::fmt_ts(util::now()),
