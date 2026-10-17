@@ -3,9 +3,18 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.1.0"
+        required: true
 
 permissions:
   contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -22,21 +31,80 @@ jobs:
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Smoke test
+        if: matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          ext=""; [ "$RUNNER_OS" = "Windows" ] && ext=".exe"
+          ./target/${{ matrix.target }}/release/local-brain${ext} --version
       - name: Package (unix)
         if: runner.os != 'Windows'
+        shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
-          tar -czf ../../../local-brain-${{ matrix.target }}.tar.gz local-brain
+          mkdir -p dist
+          cp README.md LICENSE NOTICE target/${{ matrix.target }}/release/
+          tar -C target/${{ matrix.target }}/release -czf dist/local-brain-${{ matrix.target }}.tar.gz local-brain README.md LICENSE NOTICE
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path target/${{ matrix.target }}/release/local-brain.exe -DestinationPath local-brain-${{ matrix.target }}.zip
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item README.md, LICENSE, NOTICE target/${{ matrix.target }}/release/
+          Compress-Archive -Path target/${{ matrix.target }}/release/local-brain.exe, target/${{ matrix.target }}/release/README.md, target/${{ matrix.target }}/release/LICENSE, target/${{ matrix.target }}/release/NOTICE -DestinationPath dist/local-brain-${{ matrix.target }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: local-brain-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum local-brain-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: Release notes
+        run: |
+          version="${TAG#v}"
+          awk -v v="$version" '$0 ~ "^## \\[" v "\\]" {f=1; next} /^## \[/ {f=0} f' CHANGELOG.md > notes.md
+          cat >> notes.md <<'EOF2'
+
+          ## Install
+
+          macOS / Linux:
+          ```sh
+          curl -fsSL https://raw.githubusercontent.com/koztay/local-brain/main/install.sh | sh
+          ```
+          Windows (PowerShell):
+          ```powershell
+          irm https://raw.githubusercontent.com/koztay/local-brain/main/install.ps1 | iex
+          ```
+          Or download an archive below and put `local-brain` on your PATH. Verify with `SHA256SUMS`.
+          EOF2
       - uses: softprops/action-gh-release@v2
         with:
-          files: local-brain-${{ matrix.target }}.*
-          generate_release_notes: true
+          tag_name: ${{ env.TAG }}
+          name: local-brain ${{ env.TAG }}
+          body_path: notes.md
+          files: |
+            dist/local-brain-*
+            dist/SHA256SUMS

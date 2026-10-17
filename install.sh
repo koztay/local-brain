@@ -44,10 +44,24 @@ try_release() {
   tmp=$(mktemp -d)
   say "downloading $url"
   download "$url" "$tmp/lb.tar.gz" 2>/dev/null || { rm -rf "$tmp"; return 1; }
+  # Verify the checksum published with the release.
+  if download "$(dirname "$url")/SHA256SUMS" "$tmp/SHA256SUMS" 2>/dev/null; then
+    expected=$(grep "local-brain-$target.tar.gz" "$tmp/SHA256SUMS" | awk '{print $1}')
+    if command -v sha256sum >/dev/null 2>&1; then actual=$(sha256sum "$tmp/lb.tar.gz" | awk '{print $1}')
+    else actual=$(shasum -a 256 "$tmp/lb.tar.gz" | awk '{print $1}'); fi
+    if [ -n "$expected" ] && [ "$expected" != "$actual" ]; then
+      rm -rf "$tmp"; fail "checksum mismatch for local-brain-$target.tar.gz"
+    fi
+    say "checksum verified"
+  fi
   tar -xzf "$tmp/lb.tar.gz" -C "$tmp" || { rm -rf "$tmp"; return 1; }
   mkdir -p "$INSTALL_DIR"
   mv "$tmp/local-brain" "$INSTALL_DIR/local-brain"
   chmod +x "$INSTALL_DIR/local-brain"
+  # Downloaded binaries are not notarized; clear the quarantine flag so macOS runs it.
+  if [ "$os" = "Darwin" ] && command -v xattr >/dev/null 2>&1; then
+    xattr -d com.apple.quarantine "$INSTALL_DIR/local-brain" 2>/dev/null || true
+  fi
   rm -rf "$tmp"
   return 0
 }
