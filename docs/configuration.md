@@ -11,6 +11,7 @@ directory. Unknown keys are ignored; missing keys take the defaults shown here.
 | `provider` | detected | `ollama`, `lmstudio`, `mlx`, `llamacpp`, `openai` (any OpenAI-compatible local server) or `none` |
 | `base_url` | provider default | Ollama `http://127.0.0.1:11434`, LM Studio `http://127.0.0.1:1234/v1`, MLX / llama.cpp `http://127.0.0.1:8080/v1` |
 | `keep_alive` | `"10m"` | How long the runtime keeps a model loaded after the last request (Ollama) |
+| `ollama_models_dir` | `""` | Set by `init` when it installed Ollama with the models on another drive (passed to Ollama as `OLLAMA_MODELS`). Empty = Ollama's default |
 | `timeout_secs` | `180` | Per-request timeout for model calls (hooks use shorter limits) |
 | `api_key` | `""` | Sent as a bearer token, for servers that require one |
 

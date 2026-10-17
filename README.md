@@ -142,6 +142,8 @@ commit/PR texts.
 install [Ollama](https://ollama.com) (Homebrew or the signed app on macOS, the official installer
 on Linux, winget on Windows), starts it and downloads the models for your hardware tier — one
 question, one "yes". Use `--yes` to accept without asking, or `--no-models` to stay model-free.
+Models take several GB, so when an external drive is connected `init` asks where to store them
+(and picks the roomiest drive by default when the internal disk is tight).
 
 If you already run another runtime, local-brain uses it instead; the first one found wins:
 
