@@ -1,0 +1,32 @@
+# local-brain model catalog.
+#
+# This file is versioned and intentionally NOT hard-coded in the binary's logic: `local-brain init`
+# copies it to ~/.local-brain/models.toml, and you can edit that copy at any time.
+#
+# Each tier maps a role to a model name per runtime provider. Sizes are approximate on-disk /
+# in-memory sizes (quantized) and are used to keep total model memory under ~50% of RAM.
+#
+#   S  : <= 16 GB RAM or CPU-only     -> one small multimodal model + embedding
+#   M  : 24-32 GB                     -> one stronger multimodal model + embedding (default target)
+#   L  : >= 48 GB or a strong GPU     -> separate code LLM + separate VLM + embedding (loaded on demand)
+#
+# Pick names that exist in your runtime (`ollama list`, LM Studio's model browser, `mlx_lm`).
+# The defaults below are widely available, permissively licensed, and work without "thinking" mode.
+
+version = 1
+
+[tiers.S]
+description = "Small: one compact multimodal model plus an embedding model"
+general = { ollama = "gemma3:4b", lmstudio = "google/gemma-3-4b", mlx = "mlx-community/gemma-3-4b-it-4bit", llamacpp = "gemma-3-4b-it", size_gb = 3.3, vision = true }
+embedding = { ollama = "nomic-embed-text", lmstudio = "text-embedding-nomic-embed-text-v1.5", size_gb = 0.3 }
+
+[tiers.M]
+description = "Medium: a stronger multimodal model plus an embedding model"
+general = { ollama = "gemma3:12b", lmstudio = "google/gemma-3-12b", mlx = "mlx-community/gemma-3-12b-it-4bit", llamacpp = "gemma-3-12b-it", size_gb = 8.1, vision = true }
+embedding = { ollama = "nomic-embed-text", lmstudio = "text-embedding-nomic-embed-text-v1.5", size_gb = 0.3 }
+
+[tiers.L]
+description = "Large: dedicated code model and vision model, loaded on demand, plus an embedding model"
+general = { ollama = "gemma3:27b", lmstudio = "google/gemma-3-27b", mlx = "mlx-community/gemma-3-27b-it-4bit", llamacpp = "gemma-3-27b-it", size_gb = 17.0, vision = true }
+code = { ollama = "qwen2.5-coder:32b", lmstudio = "qwen2.5-coder-32b-instruct", mlx = "mlx-community/Qwen2.5-Coder-32B-Instruct-4bit", llamacpp = "qwen2.5-coder-32b-instruct", size_gb = 20.0, vision = false }
+embedding = { ollama = "nomic-embed-text", lmstudio = "text-embedding-nomic-embed-text-v1.5", size_gb = 0.3 }

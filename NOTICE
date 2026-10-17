@@ -1,0 +1,6 @@
+local-brain
+Copyright 2026 AEOGONTECH LLC and local-brain contributors
+
+This product includes software developed by third parties, including tree-sitter and its
+language grammars (MIT), SQLite (public domain) and the Rust crates listed in Cargo.lock under
+their respective licenses.

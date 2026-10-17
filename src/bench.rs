@@ -1,0 +1,795 @@
+//! `local-brain bench`: compare total session tokens and task success for
+//! (a) vanilla Claude Code, (b) Claude Code + graphify, (c) Claude Code + local-brain.
+//!
+//! Tasks are derived from the project (seeded, reproducible) and can be edited by hand in
+//! `.local-brain/bench/tasks.json`. Each configuration runs headless (`claude -p`) in its own
+//! disposable git worktree. `--offline` gives a free, model-less estimate instead.
+
+use crate::config::Config;
+use crate::paths::{self, Project};
+use crate::store::Store;
+use crate::util;
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::io::BufRead;
+use std::path::{Path, PathBuf};
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Task {
+    pub id: String,
+    pub kind: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub verify: Verify,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct Verify {
+    /// At least `min_hits` of these strings must appear in the final answer.
+    #[serde(default)]
+    pub contains_any: Vec<String>,
+    #[serde(default)]
+    pub min_hits: usize,
+    /// A shell command run in the worktree after the task; exit 0 = success.
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub min_length: usize,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TaskSet {
+    pub version: u32,
+    pub seed: u64,
+    pub generated: i64,
+    pub tasks: Vec<Task>,
+}
+
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0 >> 33
+    }
+    fn shuffle<T>(&mut self, v: &mut [T]) {
+        for i in (1..v.len()).rev() {
+            let j = (self.next() as usize) % (i + 1);
+            v.swap(i, j);
+        }
+    }
+}
+
+fn is_testy(p: &str) -> bool {
+    let l = p.to_lowercase();
+    l.contains("test") || l.contains("spec") || l.contains("fixture") || l.contains("example")
+}
+
+fn test_command(root: &Path) -> Option<String> {
+    if root.join("Cargo.toml").exists() {
+        return Some("cargo test".into());
+    }
+    if let Ok(pkg) = std::fs::read_to_string(root.join("package.json")) {
+        if let Ok(v) = serde_json::from_str::<Value>(&pkg) {
+            if v["scripts"]["test"].is_string() {
+                return Some("npm test".into());
+            }
+        }
+    }
+    if root.join("go.mod").exists() {
+        return Some("go test ./...".into());
+    }
+    if root.join("pyproject.toml").exists()
+        || root.join("pytest.ini").exists()
+        || root.join("setup.py").exists()
+    {
+        return Some("pytest -q".into());
+    }
+    None
+}
+
+/// Derive a reproducible task set from the indexed project.
+pub fn generate(project: &Project, store: &Store, n: usize, seed: u64) -> Result<TaskSet> {
+    let mut rng = Rng(seed);
+    let mut tasks = Vec::new();
+    // Uniquely named, non-test definitions.
+    let mut st = store.conn.prepare(
+        "SELECT s.name, s.kind, f.path, s.start_line FROM symbols s JOIN files f ON f.id = s.file_id
+         WHERE s.kind IN ('function','method','class','struct','trait','interface','enum')
+           AND length(s.name) >= 5
+           AND s.name IN (SELECT name FROM symbols GROUP BY name HAVING count(*) = 1)
+         ORDER BY f.path, s.start_line",
+    )?;
+    let mut defs: Vec<(String, String, String, i64)> = st
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .flatten()
+        .filter(|d: &(String, String, String, i64)| !is_testy(&d.2) && !d.0.starts_with("test"))
+        .collect();
+    drop(st);
+    rng.shuffle(&mut defs);
+
+    // Callers: symbols called from at least two files.
+    let mut callers: Vec<(String, Vec<String>)> = Vec::new();
+    for d in defs.iter().take(400) {
+        let edges = store.edges_to(&d.0, "call")?;
+        let mut files: Vec<String> = edges
+            .iter()
+            .map(|e| e.path.clone())
+            .filter(|p| p != &d.2)
+            .collect();
+        files.sort();
+        files.dedup();
+        if files.len() >= 2 && files.len() <= 15 {
+            callers.push((d.0.clone(), files));
+        }
+    }
+
+    let n_def = (n * 2 / 5).max(1);
+    let n_call = (n * 3 / 10).max(1);
+    for (i, d) in defs.iter().take(n_def).enumerate() {
+        tasks.push(Task {
+            id: format!("def-{}", i + 1),
+            kind: "definition".into(),
+            prompt: format!("Where is the {} `{}` defined in this repository? Reply with the file path and line number, and one sentence about what it does.", d.1, d.0),
+            verify: Verify { contains_any: vec![d.2.clone()], min_hits: 1, ..Default::default() },
+        });
+    }
+    for (i, (name, files)) in callers.iter().take(n_call).enumerate() {
+        tasks.push(Task {
+            id: format!("callers-{}", i + 1),
+            kind: "callers".into(),
+            prompt: format!(
+                "Which files in this repository call `{}`? List the file paths.",
+                name
+            ),
+            verify: Verify {
+                contains_any: files.clone(),
+                min_hits: files.len().min(2),
+                ..Default::default()
+            },
+        });
+    }
+    // Architecture.
+    let mut mods: Vec<String> = store
+        .files()?
+        .iter()
+        .filter(|f| f.kind == "code")
+        .filter_map(|f| f.path.split('/').next().map(String::from))
+        .collect();
+    mods.sort();
+    mods.dedup();
+    tasks.push(Task {
+        id: "arch-1".into(),
+        kind: "architecture".into(),
+        prompt: "Explain the architecture of this repository in at most 8 sentences: its purpose, main modules and how data flows between them.".into(),
+        verify: Verify { contains_any: mods.iter().take(8).cloned().collect(), min_hits: mods.len().clamp(1, 2), min_length: 300, ..Default::default() },
+    });
+    // Documents.
+    let docs: Vec<String> = store
+        .files()?
+        .into_iter()
+        .filter(|f| f.kind == "doc")
+        .map(|f| f.path)
+        .take(3)
+        .collect();
+    for (i, d) in docs.iter().enumerate() {
+        tasks.push(Task {
+            id: format!("doc-{}", i + 1),
+            kind: "document".into(),
+            prompt: format!("Summarize what `{}` contains and list any requirements or important values it states.", d),
+            verify: Verify { min_length: 200, ..Default::default() },
+        });
+    }
+    // Tests.
+    if let Some(cmd) = test_command(&project.root) {
+        tasks.push(Task {
+            id: "tests-1".into(),
+            kind: "tests".into(),
+            prompt: format!("Run the test suite with `{}` and report how many tests passed and failed. If something fails, name the failing tests and the error. Do not change any files.", cmd),
+            verify: Verify { contains_any: vec!["pass".into(), "fail".into(), "ok".into()], min_hits: 1, ..Default::default() },
+        });
+    }
+    tasks.truncate(n.max(1));
+    Ok(TaskSet {
+        version: 1,
+        seed,
+        generated: util::now(),
+        tasks,
+    })
+}
+
+pub fn tasks_path(project: &Project) -> PathBuf {
+    project.bench_dir().join("tasks.json")
+}
+
+pub fn load_or_generate(
+    project: &Project,
+    store: &Store,
+    n: usize,
+    seed: u64,
+    regenerate: bool,
+) -> Result<TaskSet> {
+    let p = tasks_path(project);
+    if !regenerate {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            return serde_json::from_str(&s).with_context(|| format!("parsing {}", p.display()));
+        }
+    }
+    let ts = generate(project, store, n, seed)?;
+    std::fs::create_dir_all(project.bench_dir())?;
+    std::fs::write(&p, serde_json::to_string_pretty(&ts)?)?;
+    Ok(ts)
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct RunResult {
+    pub task: String,
+    pub config: String,
+    pub success: bool,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub tool_calls: i64,
+    pub turns: i64,
+    pub duration_ms: i64,
+    pub cost_usd: f64,
+    pub error: Option<String>,
+    pub answer_excerpt: String,
+}
+
+impl RunResult {
+    pub fn total(&self) -> i64 {
+        self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_write_tokens
+    }
+}
+
+fn verify(task: &Task, answer: &str, worktree: &Path) -> bool {
+    let v = &task.verify;
+    let lower = answer.to_lowercase();
+    if !v.contains_any.is_empty() {
+        let hits = v
+            .contains_any
+            .iter()
+            .filter(|s| lower.contains(&s.to_lowercase()))
+            .count();
+        if hits < v.min_hits.max(1) {
+            return false;
+        }
+    }
+    if answer.len() < v.min_length {
+        return false;
+    }
+    if let Some(cmd) = &v.command {
+        let ok = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(worktree)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return false;
+        }
+    }
+    !answer.trim().is_empty()
+}
+
+fn hooks_settings(exe: &str) -> Value {
+    let h = |ev: &str, t: u64| json!([{"hooks": [{"type": "command", "command": format!("{} hook {}", util::sh_quote(exe), ev), "timeout": t}]}]);
+    let mut pre = h("pre-tool-use", 120);
+    pre[0]["matcher"] = json!("Read|Grep|Glob");
+    let mut post = h("post-tool-use", 60);
+    post[0]["matcher"] = json!("Bash");
+    json!({"hooks": {"PreToolUse": pre, "PostToolUse": post, "SessionStart": h("session-start", 20)}})
+}
+
+fn strip_claude_md_section(worktree: &Path) {
+    let p = worktree.join("CLAUDE.md");
+    if let Ok(s) = std::fs::read_to_string(&p) {
+        if let (Some(a), Some(b)) = (
+            s.find("<!-- local-brain:start -->"),
+            s.find("<!-- local-brain:end -->"),
+        ) {
+            let _ = std::fs::write(
+                &p,
+                format!("{}{}", &s[..a], &s[b + "<!-- local-brain:end -->".len()..]),
+            );
+        }
+    }
+}
+
+struct Worktree {
+    root: PathBuf,
+    path: PathBuf,
+}
+
+impl Worktree {
+    fn create(root: &Path, dir: &Path) -> Result<Worktree> {
+        if dir.exists() {
+            let _ = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["worktree", "remove", "--force"])
+                .arg(dir)
+                .output();
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["worktree", "add", "--detach"])
+            .arg(dir)
+            .arg("HEAD")
+            .output()?;
+        if !out.status.success() {
+            bail!(
+                "git worktree add failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(Worktree {
+            root: root.to_path_buf(),
+            path: dir.to_path_buf(),
+        })
+    }
+    fn reset(&self) {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.path)
+            .args(["checkout", "--", "."])
+            .output();
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.path)
+            .args(["clean", "-fdq", "-e", ".local-brain"])
+            .output();
+    }
+}
+
+impl Drop for Worktree {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["worktree", "remove", "--force"])
+            .arg(&self.path)
+            .output();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_claude(
+    task: &Task,
+    config: &str,
+    wt: &Path,
+    mcp_config: &Value,
+    settings: Option<&Value>,
+    append: Option<&str>,
+    model: Option<&str>,
+    max_turns: u32,
+    timeout_s: u64,
+) -> RunResult {
+    let mut r = RunResult {
+        task: task.id.clone(),
+        config: config.into(),
+        ..Default::default()
+    };
+    let mut cmd = std::process::Command::new("claude");
+    cmd.current_dir(wt)
+        .arg("-p")
+        .arg(&task.prompt)
+        .args(["--output-format", "stream-json", "--verbose"])
+        .args(["--max-turns", &max_turns.to_string()])
+        .args([
+            "--strict-mcp-config",
+            "--mcp-config",
+            &mcp_config.to_string(),
+        ])
+        .args(["--allowedTools", "Read,Grep,Glob,LS,Bash,mcp__local-brain"]);
+    if let Some(s) = settings {
+        cmd.args(["--settings", &s.to_string()]);
+    }
+    if let Some(a) = append {
+        cmd.args(["--append-system-prompt", a]);
+    }
+    if let Some(m) = model {
+        cmd.args(["--model", m]);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let start = std::time::Instant::now();
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            r.error = Some(format!("could not start claude: {}", e));
+            return r;
+        }
+    };
+    let stdout = child.stdout.take().unwrap();
+    let pid = child.id();
+    let deadline = std::time::Duration::from_secs(timeout_s);
+    let killer = std::thread::spawn(move || {
+        let t0 = std::time::Instant::now();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let mut sys = sysinfo::System::new();
+            let p = sysinfo::Pid::from_u32(pid);
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[p]), true);
+            match sys.process(p) {
+                None => return,
+                Some(pr) if t0.elapsed() > deadline => {
+                    pr.kill();
+                    return;
+                }
+                _ => {}
+            }
+        }
+    });
+    let mut answer = String::new();
+    for line in std::io::BufReader::new(stdout)
+        .lines()
+        .map_while(Result::ok)
+    {
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        match v["type"].as_str() {
+            Some("assistant") => {
+                if let Some(blocks) = v["message"]["content"].as_array() {
+                    r.tool_calls +=
+                        blocks.iter().filter(|b| b["type"] == "tool_use").count() as i64;
+                }
+            }
+            Some("result") => {
+                let u = &v["usage"];
+                r.input_tokens = u["input_tokens"].as_i64().unwrap_or(0);
+                r.output_tokens = u["output_tokens"].as_i64().unwrap_or(0);
+                r.cache_read_tokens = u["cache_read_input_tokens"].as_i64().unwrap_or(0);
+                r.cache_write_tokens = u["cache_creation_input_tokens"].as_i64().unwrap_or(0);
+                r.turns = v["num_turns"].as_i64().unwrap_or(0);
+                r.duration_ms = v["duration_ms"].as_i64().unwrap_or(0);
+                r.cost_usd = v["total_cost_usd"].as_f64().unwrap_or(0.0);
+                answer = v["result"].as_str().unwrap_or("").to_string();
+                if v["is_error"].as_bool() == Some(true) {
+                    r.error = Some(format!(
+                        "claude reported an error: {}",
+                        v["subtype"].as_str().unwrap_or("")
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    let status = child.wait();
+    let _ = killer.join();
+    if r.duration_ms == 0 {
+        r.duration_ms = start.elapsed().as_millis() as i64;
+    }
+    if answer.is_empty() && r.error.is_none() {
+        let mut err = String::new();
+        if let Some(mut e) = child.stderr.take() {
+            use std::io::Read;
+            let _ = e.read_to_string(&mut err);
+        }
+        r.error = Some(format!(
+            "no result (exit {:?}): {}",
+            status.ok().and_then(|s| s.code()),
+            util::clip(err.trim(), 300)
+        ));
+    }
+    r.success = r.error.is_none() && verify(task, &answer, wt);
+    r.answer_excerpt = util::clip(&answer.replace('\n', " "), 300);
+    r
+}
+
+pub struct RunOptions {
+    pub configs: Vec<String>,
+    pub graphify_setup: Option<String>,
+    pub model: Option<String>,
+    pub max_turns: u32,
+    pub timeout_s: u64,
+    pub limit: Option<usize>,
+}
+
+/// Run the comparison with real Claude Code sessions.
+pub fn run(
+    project: &Project,
+    cfg: &Config,
+    ts: &TaskSet,
+    opts: &RunOptions,
+) -> Result<(PathBuf, String)> {
+    let claude_version = std::process::Command::new("claude")
+        .arg("--version")
+        .output()
+        .context("the `claude` CLI is required for `bench` (use --offline for an estimate)")?;
+    let claude_version = String::from_utf8_lossy(&claude_version.stdout)
+        .trim()
+        .to_string();
+    let exe = paths::exe();
+    let scratch = std::env::temp_dir().join(format!("local-brain-bench-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch)?;
+    let tasks: Vec<&Task> = ts
+        .tasks
+        .iter()
+        .take(opts.limit.unwrap_or(usize::MAX))
+        .collect();
+    let mut results: Vec<RunResult> = Vec::new();
+    let empty_mcp = json!({"mcpServers": {}});
+    let _ = cfg;
+    for config in &opts.configs {
+        let wt = Worktree::create(&project.root, &scratch.join(config))?;
+        let (mcp, settings, append): (Value, Option<Value>, Option<String>) = match config.as_str()
+        {
+            "vanilla" => {
+                strip_claude_md_section(&wt.path);
+                (empty_mcp.clone(), Some(json!({"hooks": {}})), None)
+            }
+            "graphify" => {
+                strip_claude_md_section(&wt.path);
+                let Some(setup) = &opts.graphify_setup else {
+                    eprintln!("  skipping graphify: pass --graphify-setup \"<command that installs graphify into the current repo>\"");
+                    continue;
+                };
+                eprintln!("  setting up graphify: {}", setup);
+                let ok = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(setup)
+                    .current_dir(&wt.path)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !ok {
+                    eprintln!("  graphify setup failed; skipping");
+                    continue;
+                }
+                // graphify's own setup writes its MCP/CLAUDE.md config into the worktree.
+                let mcp = std::fs::read_to_string(wt.path.join(".mcp.json"))
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or(empty_mcp.clone());
+                (mcp, None, None)
+            }
+            "local-brain" => {
+                strip_claude_md_section(&wt.path);
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(project.dir(), wt.path.join(paths::PROJECT_DIR))?;
+                #[cfg(not(unix))]
+                bail!("bench for local-brain currently needs a Unix-like OS");
+                let mcp = json!({"mcpServers": {"local-brain": {"command": exe, "args": ["mcp", "--project", wt.path]}}});
+                let section = "This project is indexed by local-brain. For questions about the code use brain_query first; fetch code with brain_slice instead of reading whole files; read images/PDFs with brain_doc; get full compressed outputs with brain_raw.";
+                (mcp, Some(hooks_settings(&exe)), Some(section.to_string()))
+            }
+            other => {
+                eprintln!(
+                    "  unknown config `{}` (use vanilla, graphify, local-brain)",
+                    other
+                );
+                continue;
+            }
+        };
+        for (i, t) in tasks.iter().enumerate() {
+            eprint!("  [{}] {}/{} {} … ", config, i + 1, tasks.len(), t.id);
+            let r = run_claude(
+                t,
+                config,
+                &wt.path,
+                &mcp,
+                settings.as_ref(),
+                append.as_deref(),
+                opts.model.as_deref(),
+                opts.max_turns,
+                opts.timeout_s,
+            );
+            eprintln!(
+                "{} · {} tokens · {} tool calls{}",
+                if r.success { "ok" } else { "FAIL" },
+                util::human_tokens(r.total()),
+                r.tool_calls,
+                r.error
+                    .as_ref()
+                    .map(|e| format!(" · {}", e))
+                    .unwrap_or_default()
+            );
+            results.push(r);
+            wt.reset();
+        }
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+    write_report(
+        project,
+        ts,
+        &results,
+        &claude_version,
+        opts.model.as_deref(),
+    )
+}
+
+#[derive(Default, Serialize)]
+struct Agg {
+    tasks: usize,
+    successes: usize,
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    tool_calls: i64,
+    duration_ms: i64,
+    cost_usd: f64,
+}
+
+fn write_report(
+    project: &Project,
+    ts: &TaskSet,
+    results: &[RunResult],
+    claude_version: &str,
+    model: Option<&str>,
+) -> Result<(PathBuf, String)> {
+    let mut agg: BTreeMap<String, Agg> = BTreeMap::new();
+    for r in results {
+        let a = agg.entry(r.config.clone()).or_default();
+        a.tasks += 1;
+        a.successes += r.success as usize;
+        a.input += r.input_tokens;
+        a.output += r.output_tokens;
+        a.cache_read += r.cache_read_tokens;
+        a.cache_write += r.cache_write_tokens;
+        a.tool_calls += r.tool_calls;
+        a.duration_ms += r.duration_ms;
+        a.cost_usd += r.cost_usd;
+    }
+    let total = |a: &Agg| a.input + a.output + a.cache_read + a.cache_write;
+    let mut md = format!(
+        "# local-brain bench report\n\n- Date: {}\n- local-brain: {}\n- Claude Code: {}\n- Model: {}\n- Task set: {} tasks, seed {}\n\n",
+        util::fmt_ts(util::now()),
+        env!("CARGO_PKG_VERSION"),
+        claude_version,
+        model.unwrap_or("default"),
+        ts.tasks.len(),
+        ts.seed
+    );
+    md.push_str("| Config | Success | Total tokens | Input | Output | Cache read | Cache write | Tool calls | Time | Cost |\n|---|---|---|---|---|---|---|---|---|---|\n");
+    for (c, a) in &agg {
+        md.push_str(&format!(
+            "| {} | {}/{} | {} | {} | {} | {} | {} | {} | {:.0}s | ${:.2} |\n",
+            c,
+            a.successes,
+            a.tasks,
+            total(a),
+            a.input,
+            a.output,
+            a.cache_read,
+            a.cache_write,
+            a.tool_calls,
+            a.duration_ms as f64 / 1000.0,
+            a.cost_usd
+        ));
+    }
+    if let Some(lb) = agg.get("local-brain") {
+        for other in ["graphify", "vanilla"] {
+            if let Some(o) = agg.get(other) {
+                if total(o) > 0 {
+                    let pct = 100.0 * (total(o) - total(lb)) as f64 / total(o) as f64;
+                    md.push_str(&format!(
+                        "\nlocal-brain vs {}: {:+.1}% total tokens ({}), success {}/{} vs {}/{}.",
+                        other,
+                        -pct,
+                        if pct >= 0.0 { "lower" } else { "higher" },
+                        lb.successes,
+                        lb.tasks,
+                        o.successes,
+                        o.tasks
+                    ));
+                }
+            }
+        }
+        md.push('\n');
+    }
+    md.push_str("\n## Per task\n\n| Task | Config | OK | Total tokens | Tool calls | Turns |\n|---|---|---|---|---|---|\n");
+    for r in results {
+        md.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
+            r.task,
+            r.config,
+            if r.success { "✓" } else { "✗" },
+            r.total(),
+            r.tool_calls,
+            r.turns
+        ));
+    }
+    let ts_now = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    std::fs::create_dir_all(project.bench_dir())?;
+    let md_path = project.bench_dir().join(format!("report-{}.md", ts_now));
+    let json_path = project.bench_dir().join(format!("report-{}.json", ts_now));
+    std::fs::write(&md_path, &md)?;
+    std::fs::write(
+        &json_path,
+        serde_json::to_string_pretty(&json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "claude_version": claude_version,
+            "model": model,
+            "seed": ts.seed,
+            "tasks": ts.tasks,
+            "aggregates": agg,
+            "results": results,
+        }))?,
+    )?;
+    Ok((md_path, md))
+}
+
+/// Free estimate without running Claude: what exploring with Grep + Read would put into the
+/// context versus what brain_query + brain_slice return.
+pub fn offline(project: &Project, cfg: &Config, store: &Store, ts: &TaskSet) -> Result<String> {
+    let mut out = String::from("Offline estimate (no Claude calls; vanilla = grep the name + read the files it is found in, capped like the Read tool):\n\n| Task | Vanilla est. | local-brain | Saved |\n|---|---|---|---|\n");
+    let (mut tv, mut tl) = (0i64, 0i64);
+    for t in &ts.tasks {
+        if !matches!(t.kind.as_str(), "definition" | "callers" | "architecture") {
+            continue;
+        }
+        let name = t.prompt.split('`').nth(1).unwrap_or("").to_string();
+        let mut vanilla = 300;
+        if !name.is_empty() {
+            let re = regex::Regex::new(&format!(r"\b{}\b", regex::escape(&name)))?;
+            let mut grep_out = 0;
+            let mut files_read = 0;
+            for f in store.files()? {
+                if f.kind == "doc" {
+                    continue;
+                }
+                if let Some(text) = util::read_text(&project.abs(&f.path)) {
+                    let n = text.lines().filter(|l| re.is_match(l)).count();
+                    if n > 0 {
+                        grep_out += n as i64 * 30;
+                        if files_read < 4 {
+                            vanilla += util::tokens(&text).min(25_000);
+                            files_read += 1;
+                        }
+                    }
+                }
+            }
+            vanilla += grep_out.min(20_000);
+        } else {
+            // Architecture questions: a vanilla agent typically reads the README and several entry files.
+            let mut files: Vec<_> = store
+                .files()?
+                .into_iter()
+                .filter(|f| f.kind != "doc")
+                .collect();
+            files.sort_by_key(|f| f.path.matches('/').count());
+            for f in files.iter().take(8) {
+                vanilla += util::tokens_len(f.size as u64).min(25_000);
+            }
+        }
+        let q = t.prompt.clone();
+        let a = crate::query::query(store, project, cfg, None, &q, None)?;
+        let mut lb = util::tokens(&a.text) + 150;
+        if t.kind == "definition" {
+            if let Some(f) = a.files.first() {
+                if let Ok(sl) = crate::slice::slice(store, project, f, Some(&name), None) {
+                    lb += util::tokens(&sl.text);
+                }
+            }
+        }
+        tv += vanilla;
+        tl += lb;
+        out.push_str(&format!(
+            "| {} | {} | {} | {:.0}% |\n",
+            t.id,
+            vanilla,
+            lb,
+            100.0 * (vanilla - lb) as f64 / vanilla.max(1) as f64
+        ));
+    }
+    out.push_str(&format!(
+        "\nTotal: vanilla ≈ {} tokens, local-brain ≈ {} tokens ({:.0}% less). Run `local-brain bench` with the `claude` CLI installed for real session measurements.\n",
+        util::human_tokens(tv),
+        util::human_tokens(tl),
+        100.0 * (tv - tl) as f64 / tv.max(1) as f64
+    ));
+    Ok(out)
+}

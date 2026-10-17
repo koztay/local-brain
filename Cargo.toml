@@ -1,0 +1,50 @@
+[package]
+name = "local-brain"
+version = "0.1.0"
+edition = "2021"
+description = "A local helper brain for coding agents: code graph, embeddings, summaries, output compression and memory — all on your machine."
+license = "Apache-2.0"
+repository = "https://github.com/koztay/local-brain"
+readme = "README.md"
+keywords = ["mcp", "claude-code", "code-search", "tree-sitter", "llm"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.80"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+ignore = "0.4"
+globset = "0.4"
+regex = "1"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+ureq = { version = "2", features = ["json"] }
+sysinfo = { version = "0.32", default-features = false, features = ["system", "disk"] }
+notify = "6"
+pdf-extract = "0.7"
+dirs = "5"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-swift = "0.7"
+tree-sitter-kotlin-ng = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
