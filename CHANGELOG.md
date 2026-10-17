@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.5] - 2026-10-17
+
+### Security
+- 0.1.4 read images/PDFs outside the project in a `PreToolUse` hook, which runs *before*
+  Claude Code's permission check, so a file Claude Code would have refused could still be read
+  and described to the model. Read is now handled entirely in `PostToolUse`: local-brain only
+  processes files Claude Code was allowed to read, and deny rules apply. Paths are resolved
+  (symlinks, `..`) before deciding whether a file is in the project. Please update from 0.1.4.
+
+### Changed
+- Large files are also replaced by their outline after the read (same savings). Escape hatch: a
+  Read with `offset`/`limit` is never replaced — the original image with `offset: 1`, a large
+  file in ranges — because Claude Code rejects an identical repeated Read.
+- The image description notes that a small local model can misread exact text and numbers.
+- Existing projects get the new hook configuration automatically on the next command (the
+  check now compares matchers and timeouts, not only which events are present).
+
 ## [0.1.4] - 2026-10-17
 
 ### Added

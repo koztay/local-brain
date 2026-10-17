@@ -143,6 +143,43 @@ pub fn repair_stale(exe: &str) -> Vec<String> {
     msgs
 }
 
+/// Every hook this version installs, as (event, settings entry).
+fn our_hooks(exe: &str) -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "PreToolUse",
+            hook_entry(exe, "pre-tool-use", 60, Some("Grep|Glob")),
+        ),
+        // Read is handled after the permission check (images/PDFs, large files).
+        (
+            "PostToolUse",
+            hook_entry(exe, "post-tool-use", 120, Some("Bash|Read")),
+        ),
+        ("SessionStart", hook_entry(exe, "session-start", 20, None)),
+        (
+            "UserPromptSubmit",
+            hook_entry(exe, "user-prompt-submit", 15, None),
+        ),
+        ("Stop", hook_entry(exe, "stop", 10, None)),
+        ("SessionEnd", hook_entry(exe, "session-end", 15, None)),
+    ]
+}
+
+/// A hook entry with the binary path stripped from its command, for comparisons.
+fn normalize_entry(entry: &Value) -> Value {
+    let mut e = entry.clone();
+    if let Some(hs) = e["hooks"].as_array_mut() {
+        for h in hs {
+            if let Some(cmd) = h["command"].as_str() {
+                if let Some(i) = cmd.rfind(" hook ") {
+                    h["command"] = json!(cmd[i..].to_string());
+                }
+            }
+        }
+    }
+    e
+}
+
 fn hook_entry(exe: &str, event: &str, timeout: u64, matcher: Option<&str>) -> Value {
     let cmd = format!("{} hook {}", crate::util::sh_quote(exe), event);
     let mut v = json!({"hooks": [{"type": "command", "command": cmd, "timeout": timeout}]});
@@ -246,34 +283,19 @@ impl ClaudeCode {
         Ok("registered MCP server in .mcp.json (claude CLI not found)".into())
     }
 
-    /// Hook events this version installs.
-    const EVENTS: [&'static str; 6] = [
-        "PreToolUse",
-        "PostToolUse",
-        "SessionStart",
-        "UserPromptSubmit",
-        "Stop",
-        "SessionEnd",
-    ];
-
-    /// True when every hook this version installs is present and CLAUDE.md has the current section.
+    /// True when every hook this version installs is present with the same matcher, timeout
+    /// and handler (whichever binary it calls), and CLAUDE.md has the current section.
     fn is_current(project: &Project) -> bool {
         let s = read_json(&Self::settings_path(project)).unwrap_or(json!({}));
-        let has = |ev: &str| {
-            s["hooks"][ev]
+        let hooks_ok = our_hooks("local-brain").into_iter().all(|(event, want)| {
+            let want = normalize_entry(&want);
+            s["hooks"][event]
                 .as_array()
-                .map(|gs| {
-                    gs.iter().any(|g| {
-                        g["hooks"]
-                            .as_array()
-                            .map(|hs| hs.iter().any(is_ours))
-                            .unwrap_or(false)
-                    })
-                })
+                .map(|gs| gs.iter().any(|g| normalize_entry(g) == want))
                 .unwrap_or(false)
-        };
+        });
         let md = std::fs::read_to_string(project.root.join("CLAUDE.md")).unwrap_or_default();
-        Self::EVENTS.iter().all(|e| has(e)) && md.contains(CLAUDE_MD_SECTION.trim_end())
+        hooks_ok && md.contains(CLAUDE_MD_SECTION.trim_end())
     }
 
     fn mcp_registered(project: &Project) -> Option<String> {
@@ -317,41 +339,14 @@ impl Agent for ClaudeCode {
         let sp = Self::settings_path(project);
         let mut s = read_json(&sp)?;
         Self::remove_our_hooks(&mut s);
-        let add = |s: &mut Value, event: &str, entry: Value| {
-            if !s["hooks"].is_object() {
-                s["hooks"] = json!({});
-            }
-            let arr = s["hooks"][event].as_array().cloned().unwrap_or_default();
-            let mut arr = arr;
+        if !s["hooks"].is_object() {
+            s["hooks"] = json!({});
+        }
+        for (event, entry) in our_hooks(exe) {
+            let mut arr = s["hooks"][event].as_array().cloned().unwrap_or_default();
             arr.push(entry);
             s["hooks"][event] = Value::Array(arr);
-        };
-        add(
-            &mut s,
-            "PreToolUse",
-            hook_entry(exe, "pre-tool-use", 120, Some("Read|Grep|Glob")),
-        );
-        add(
-            &mut s,
-            "PostToolUse",
-            hook_entry(exe, "post-tool-use", 60, Some("Bash")),
-        );
-        add(
-            &mut s,
-            "SessionStart",
-            hook_entry(exe, "session-start", 20, None),
-        );
-        add(
-            &mut s,
-            "UserPromptSubmit",
-            hook_entry(exe, "user-prompt-submit", 15, None),
-        );
-        add(&mut s, "Stop", hook_entry(exe, "stop", 10, None));
-        add(
-            &mut s,
-            "SessionEnd",
-            hook_entry(exe, "session-end", 15, None),
-        );
+        }
         write_json(&sp, &s)?;
         done.push(format!("installed hooks in {}", project.rel(&sp)));
         if ensure_gitignore(&project.root, ".claude/settings.local.json")? {
@@ -490,7 +485,7 @@ impl Agent for ClaudeCode {
         events.sort();
         events.dedup();
         out.push(Check {
-            ok: events.len() >= Self::EVENTS.len() && !stale_exe,
+            ok: events.len() >= our_hooks(exe).len() && !stale_exe,
             label: "Claude Code hooks".into(),
             detail: if events.is_empty() {
                 "none installed — run `local-brain init`".into()
@@ -551,6 +546,31 @@ mod tests {
             Some("/Users/a b/bin/local-brain")
         );
         assert_eq!(hook_binary("echo user"), None);
+    }
+
+    #[test]
+    fn hook_comparison_ignores_the_binary() {
+        let a = normalize_entry(&hook_entry(
+            "/opt/homebrew/bin/local-brain",
+            "stop",
+            10,
+            None,
+        ));
+        let b = normalize_entry(&hook_entry("/x/y/local-brain", "stop", 10, None));
+        assert_eq!(a, b);
+        let c = normalize_entry(&hook_entry(
+            "/x/y/local-brain",
+            "post-tool-use",
+            60,
+            Some("Bash"),
+        ));
+        let d = normalize_entry(&hook_entry(
+            "/x/y/local-brain",
+            "post-tool-use",
+            120,
+            Some("Bash|Read"),
+        ));
+        assert_ne!(c, d);
     }
 
     #[test]

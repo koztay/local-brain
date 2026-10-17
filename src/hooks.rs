@@ -1,6 +1,8 @@
 //! Claude Code hook handler: `local-brain hook <event>` reads the hook JSON on stdin.
 //!
-//! * PreToolUse Read  — images/PDFs are read locally; large files get a skeleton instead.
+//! * PostToolUse Read — images/PDFs are replaced by their local description and large files by
+//!   their outline. It runs after Claude Code's permission check, so local-brain never reads a
+//!   file Claude Code was not allowed to read.
 //! * PreToolUse Grep/Glob — oversized result sets are ranked with the graph and trimmed.
 //! * PostToolUse Bash — long test/build/log output is compressed (`updatedToolOutput`).
 //! * SessionStart — a short project brief is injected.
@@ -77,7 +79,6 @@ pub fn handle(event: &str, v: &Value) -> Result<Option<Value>> {
     let tool = v["tool_name"].as_str().unwrap_or("");
     let input = &v["tool_input"];
     match (event, tool) {
-        ("pre-tool-use", "Read") => pre_read(&project, &cfg, &store, &session, input),
         ("pre-tool-use", "Grep") if cfg.hooks.grep => {
             pre_grep(&project, &cfg, &store, &session, input, v)
         }
@@ -86,6 +87,9 @@ pub fn handle(event: &str, v: &Value) -> Result<Option<Value>> {
         }
         ("post-tool-use", "Bash") if cfg.hooks.bash => {
             post_bash(&project, &cfg, &store, &session, input, &v["tool_response"])
+        }
+        ("post-tool-use", "Read") => {
+            post_read(&project, &cfg, &store, &session, input, &v["tool_response"])
         }
         ("session-start", _) if cfg.hooks.session_brief => {
             session_start(&project, &cfg, &store, &session)
@@ -132,100 +136,144 @@ fn escape(store: &Store, session: &str, key: &str) -> Result<bool> {
 
 // ---- Read ----------------------------------------------------------------------------------
 
-fn pre_read(
+/// True when `path` is a file whose real location (symlinks and `..` resolved) is inside the
+/// project.
+fn inside_project(project: &Project, path: &Path) -> bool {
+    match (
+        std::fs::canonicalize(path),
+        std::fs::canonicalize(&project.root),
+    ) {
+        (Ok(p), Ok(root)) => p.is_file() && p.starts_with(root),
+        _ => false,
+    }
+}
+
+/// A replacement for a Read result, in the shape of a text-file Read (required by Claude Code).
+fn text_result(file_path: &str, content: String) -> Value {
+    let lines = content.lines().count();
+    json!({"hookSpecificOutput": {
+        "hookEventName": "PostToolUse",
+        "updatedToolOutput": {"type": "text", "file": {
+            "filePath": file_path, "content": content,
+            "numLines": lines, "startLine": 1, "totalLines": lines
+        }}
+    }})
+}
+
+/// PostToolUse Read. Runs after Claude Code's permission check, so local-brain only ever
+/// processes files Claude Code itself was allowed to read:
+/// * images/PDFs (in the project, or outside it when `read_outside_docs`) are replaced by their
+///   local description;
+/// * large text files in the project are replaced by their outline.
+///
+/// Reading the same file again within the retry window returns the original.
+fn post_read(
     project: &Project,
     cfg: &Config,
     store: &Store,
     session: &str,
     input: &Value,
+    resp: &Value,
 ) -> Result<Option<Value>> {
     let Some(fp) = input["file_path"].as_str() else {
         return Ok(None);
     };
-    let abs = PathBuf::from(fp);
-    if !abs.is_file() {
+    // An explicit offset/limit is the way to get the original: Claude Code itself rejects an
+    // identical repeated Read, so "read it again" cannot be the escape hatch.
+    if input.get("offset").map(|o| !o.is_null()).unwrap_or(false)
+        || input.get("limit").map(|l| !l.is_null()).unwrap_or(false)
+    {
         return Ok(None);
     }
-    if !abs.starts_with(&project.root) {
-        // Outside the project only images/PDFs are handled (screenshots in ~/Desktop, …).
-        let name = abs.to_string_lossy();
-        let doc = crate::docs::is_image(&name) || crate::docs::is_pdf(&name);
-        if !(doc && cfg.hooks.read_docs && cfg.hooks.read_outside_docs) {
+    let abs = PathBuf::from(fp);
+    let inside = inside_project(project, &abs);
+    let name = abs.to_string_lossy().to_string();
+    let is_doc = crate::docs::is_image(&name) || crate::docs::is_pdf(&name);
+
+    if is_doc {
+        if !cfg.hooks.read_docs
+            || (!inside && !cfg.hooks.read_outside_docs)
+            || resp["type"] == "text"
+        {
             return Ok(None);
         }
-    }
-    let rel = project.rel(&abs);
-    let key = format!("read:{}", rel);
-    let is_doc = crate::docs::is_image(&rel) || crate::docs::is_pdf(&rel);
-
-    if is_doc && cfg.hooks.read_docs {
+        let path = if inside { project.rel(&abs) } else { name };
+        let key = format!("read:{}", path);
         if escape(store, session, &key)? {
             return Ok(None);
         }
         let mut c = cfg.clone();
         c.runtime.timeout_secs = c.runtime.timeout_secs.min(100);
         let llm = Llm::new(&c);
-        return match crate::docs::read_doc(store, project, &c, &llm, &rel, None) {
-            Ok(d) => {
-                store.record_denial(session, &key)?;
-                store.record_metric(
-                    "hook",
-                    "read_doc",
-                    d.baseline_tokens,
-                    util::tokens(&d.text),
-                    Some(session),
-                )?;
-                Ok(deny(format!(
-                    "[local-brain] This file was read locally to save image/PDF tokens; its content is below. \
-                     For a specific question use brain_doc(path, question). If you really need the original, call Read on it again.\n\n{}",
-                    d.text
-                )))
-            }
+        let d = match crate::docs::read_doc(store, project, &c, &llm, &path, None) {
+            Ok(d) => d,
             Err(e) => {
-                log(&format!("read_doc {}: {}", rel, e));
-                Ok(None)
+                log(&format!("read_doc {}: {}", path, e));
+                return Ok(None);
             }
         };
+        store.record_denial(session, &key)?;
+        store.record_metric(
+            "hook",
+            "read_doc",
+            d.baseline_tokens,
+            util::tokens(&d.text),
+            Some(session),
+        )?;
+        return Ok(Some(text_result(
+            fp,
+            format!(
+                "[local-brain] Read locally to save image/PDF tokens. For a specific question use \
+                 brain_doc(path, question). The description comes from a small local model: when exact \
+                 text, numbers or pixel-level layout matter, get the original image with Read and \
+                 offset: 1.\n\n{}\n",
+                d.text
+            ),
+        )));
     }
 
-    if !cfg.hooks.read_large || is_doc {
+    // Large text files in the project → outline.
+    if !inside || !cfg.hooks.read_large || resp["type"] != "text" {
         return Ok(None);
     }
-    if input.get("offset").map(|o| !o.is_null()).unwrap_or(false)
-        || input.get("limit").map(|l| !l.is_null()).unwrap_or(false)
-    {
-        return Ok(None);
-    }
-    let md = std::fs::metadata(&abs)?;
-    if md.len() < (cfg.hooks.large_file_tokens * 4) as u64 / 2 {
-        return Ok(None);
-    }
-    let Some(text) = util::read_text(&abs) else {
+    let Some(text) = resp["file"]["content"].as_str() else {
         return Ok(None);
     };
-    let lines = text.lines().count();
-    let toks = util::tokens(&text);
+    let lines = resp["file"]["totalLines"]
+        .as_u64()
+        .map(|n| n as usize)
+        .unwrap_or_else(|| text.lines().count());
+    let toks = util::tokens(text);
     if lines <= cfg.hooks.large_file_lines && toks <= cfg.hooks.large_file_tokens {
         return Ok(None);
     }
+    let rel = project.rel(&abs);
+    let key = format!("read:{}", rel);
     if escape(store, session, &key)? {
         return Ok(None);
     }
     let skel = crate::slice::skeleton(store, project, &rel)?;
     let (skel, _) = util::clip_tokens(&skel, 2500);
     store.record_denial(session, &key)?;
-    // Claude's Read returns at most ~2000 lines / 25k tokens.
     store.record_metric(
         "hook",
         "read_large",
-        toks.min(25_000),
+        toks,
         util::tokens(&skel),
         Some(session),
     )?;
-    Ok(deny(format!(
-        "[local-brain] {} is large ({} lines, ~{} tokens). Its outline is below. Fetch only what you need with \
-         brain_slice(path=\"{}\", symbol=\"…\") or Read with offset/limit. To read the whole file anyway, call Read again unchanged.\n\n{}",
-        rel, lines, util::human_tokens(toks), rel, skel
+    Ok(Some(text_result(
+        fp,
+        format!(
+            "[local-brain] {} is large ({} lines, ~{} tokens). Its outline is below. Fetch only what \
+             you need with brain_slice(path=\"{}\", symbol=\"…\") or Read with offset/limit. To read \
+             the whole file anyway, read it in ranges (offset: 1, limit: 1000, then offset: 1001, …).\n\n{}\n",
+            rel,
+            lines,
+            util::human_tokens(toks),
+            rel,
+            skel
+        ),
     )))
 }
 
@@ -1105,6 +1153,24 @@ mod tests {
         assert!(segment_matches("panel", "panelinin"));
         assert!(!segment_matches("app", "application"));
         assert!(is_test_path("apps/web/e2e/admin.spec.ts"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_out_of_the_project_are_outside() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("proj");
+        let outside = d.path().join("secret");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("a.png"), b"x").unwrap();
+        std::fs::write(outside.join("passport.pdf"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let p = Project::new(root.clone());
+        assert!(inside_project(&p, &root.join("a.png")));
+        assert!(!inside_project(&p, &root.join("link/passport.pdf")));
+        assert!(!inside_project(&p, &root.join("../secret/passport.pdf")));
+        assert!(!inside_project(&p, &outside.join("passport.pdf")));
     }
 
     #[test]
