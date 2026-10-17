@@ -369,6 +369,26 @@ fn parse_transcript(text: &str) -> Transcript {
 
 type Extracted = (String, Vec<(String, Option<String>)>, Vec<String>);
 
+/// "None", "N/A", "-" and the like: how a model says there is nothing to record.
+fn is_placeholder(s: &str) -> bool {
+    let t = s
+        .trim()
+        .trim_matches(|c: char| c == '.' || c == '"' || c == '\'');
+    t.is_empty()
+        || [
+            "none",
+            "n/a",
+            "na",
+            "null",
+            "nil",
+            "-",
+            "nothing",
+            "no todos",
+            "no decisions",
+        ]
+        .contains(&t.to_lowercase().as_str())
+}
+
 fn heuristic_extract(t: &Transcript) -> Extracted {
     let summary = match t.prompts.first() {
         Some(p) => format!("Asked: {}", util::clip(&p.replace('\n', " "), 200)),
@@ -471,6 +491,16 @@ pub fn ingest_transcript(
     if todos.is_empty() {
         todos = td;
     }
+    // A session that changed no files made no technical decisions: what a small model extracts
+    // from a Q&A session is its answer restated ("Used src/util.rs:144 to locate …"). Such entries
+    // also reach every later session brief, so they cost tokens there and change the brief from
+    // one session to the next.
+    if edited.is_empty() {
+        decisions.clear();
+        todos.clear();
+    }
+    decisions.retain(|(w, _)| !is_placeholder(w));
+    todos.retain(|t| !is_placeholder(t));
     store.conn.execute(
         "DELETE FROM memory WHERE session_id = ? AND source = 'auto'",
         [session],
@@ -526,6 +556,52 @@ pub fn ingest_transcript(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ingest_lines(lines: &[serde_json::Value]) -> (usize, usize) {
+        let d = tempfile::tempdir().unwrap();
+        let project = Project::new(d.path().to_path_buf());
+        let tr = d.path().join("t.jsonl");
+        let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        std::fs::write(&tr, text.join("\n")).unwrap();
+        // Default config: no model runtime, so the rule-based extraction runs.
+        ingest_transcript(&project, &Config::default(), tr.to_str().unwrap(), "s1").unwrap();
+        let store = Store::open(&project).unwrap();
+        (
+            list(&store, Some("decision"), 20).unwrap().len(),
+            list(&store, Some("session"), 20).unwrap().len(),
+        )
+    }
+
+    #[test]
+    fn read_only_sessions_record_no_decisions() {
+        let ask = serde_json::json!({"type": "user", "message": {"content": "Where is cosine defined in this repo?"}});
+        let answer = serde_json::json!({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "We decided to use the embed module; cosine is at src/embed.rs:142."}
+        ]}});
+        let (decisions, sessions) = ingest_lines(&[ask.clone(), answer.clone()]);
+        assert_eq!(
+            (decisions, sessions),
+            (0, 1),
+            "summary kept, no invented decisions"
+        );
+
+        let edit = serde_json::json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Edit", "input": {"file_path": "src/embed.rs"}}
+        ]}});
+        let (decisions, _) = ingest_lines(&[ask, answer, edit]);
+        assert!(
+            decisions > 0,
+            "sessions that change code still record decisions"
+        );
+    }
+
+    #[test]
+    fn placeholders_are_not_memory() {
+        for p in ["None", "none.", "N/A", "\"null\"", "-", "  ", "No todos"] {
+            assert!(is_placeholder(p), "{p:?}");
+        }
+        assert!(!is_placeholder("Nonce reuse check in the auth module"));
+    }
 
     #[test]
     fn parses_transcript_lines() {

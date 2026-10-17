@@ -169,6 +169,9 @@ enum Cmd {
         /// Load your own Claude Code settings and plugins in the sessions (default: left out)
         #[arg(long)]
         with_user_settings: bool,
+        /// Save every session's full stream-json transcript under .local-brain/bench/transcripts/
+        #[arg(long)]
+        keep_transcripts: bool,
     },
     /// Check runtime, models, hooks and MCP; optionally switch the runtime provider
     Doctor {
@@ -489,6 +492,7 @@ fn real_main(cli: Cli) -> Result<i32> {
             report,
             repeat,
             with_user_settings,
+            keep_transcripts,
         } => {
             if let Some(json) = report {
                 let (path, md) = bench::rerender(&json)?;
@@ -532,6 +536,7 @@ fn real_main(cli: Cli) -> Result<i32> {
                     limit,
                     repeat,
                     isolate: !with_user_settings,
+                    keep_transcripts,
                 };
                 eprintln!("Running real Claude Code sessions in disposable worktrees (this uses your Claude plan/API credits).");
                 let (path, md) = bench::run(&p, &cfg, &ts, &opts)?;

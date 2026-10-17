@@ -18,12 +18,20 @@ All notable changes to this project are documented here. The format follows
   cache writes, billed at full price). The old headline, total tokens, is dominated by cheap
   cache reads and showed savings that cost more. `bench --report <json>` re-renders a saved run.
 - `bench` sessions leave out the user's own Claude Code settings and plugins
-  (`--setting-sources project,local`); with plugins installed they added the same ~10k-token
-  floor to every configuration and hid the differences. `--with-user-settings` restores them.
+  and local settings (`--setting-sources project`); with plugins installed they added the same
+  ~10k-token floor to every configuration and hid the differences. Local settings are left out
+  because Claude Code reads them from the main checkout for a git worktree: every configuration
+  inherited the project's own local-brain hooks, and the local-brain configuration got its brief
+  twice plus the per-prompt note. `--with-user-settings` restores both.
 - `bench --repeat N` runs the task set N times and shows each configuration's cost range, so
   run-to-run noise can be told apart from real differences.
 
 ### Fixed
+- Session memory no longer records "decisions" and "todos" from sessions that changed no files.
+  From Q&A sessions the local model restated its answer as a decision ("Used src/util.rs:144 to
+  locate …"); these filled the session brief that every later session pays for, and changed it
+  from one session to the next. Placeholder todos ("None", "N/A") are dropped. To clean an
+  existing project: entries are archived, not deleted, with `local-brain memory done <id>`.
 - The per-prompt context note was also added to prompts Claude Code generates itself
   (background-task and monitor notifications, local command output), about 450 tokens each
   that nobody asked for; in one long session these were most of the note's cost. They are now

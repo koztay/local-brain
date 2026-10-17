@@ -377,6 +377,7 @@ fn run_claude(
     max_turns: u32,
     timeout_s: u64,
     isolate: bool,
+    transcript: Option<&Path>,
 ) -> RunResult {
     let mut r = RunResult {
         task: task.id.clone(),
@@ -397,9 +398,11 @@ fn run_claude(
         .args(["--allowedTools", "Read,Grep,Glob,LS,Bash,mcp__local-brain"]);
     if isolate {
         // Leave out the user's own settings (plugins, hooks, status line): they add the same
-        // large floor to every configuration and hide the differences being measured. Project
-        // settings (graphify's hooks) and --settings (local-brain's) still apply.
-        cmd.args(["--setting-sources", "project,local"]);
+        // large floor to every configuration and hide the differences being measured. Also leave
+        // out `local`: Claude Code reads it from the *main* checkout for a git worktree, so every
+        // configuration would inherit the hooks local-brain installed there. The worktree's
+        // project settings (graphify's hooks) and --settings (local-brain's) still apply.
+        cmd.args(["--setting-sources", "project"]);
     }
     if let Some(s) = settings {
         cmd.args(["--settings", &s.to_string()]);
@@ -442,10 +445,15 @@ fn run_claude(
         }
     });
     let mut answer = String::new();
+    let mut keep = transcript.and_then(|p| std::fs::File::create(p).ok());
     for line in std::io::BufReader::new(stdout)
         .lines()
         .map_while(Result::ok)
     {
+        if let Some(f) = keep.as_mut() {
+            use std::io::Write;
+            let _ = writeln!(f, "{}", line);
+        }
         let Ok(v) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -509,6 +517,8 @@ pub struct RunOptions {
     pub repeat: usize,
     /// Exclude the user's settings and plugins from the sessions.
     pub isolate: bool,
+    /// Save each session's stream-json under `.local-brain/bench/transcripts/<run>/`.
+    pub keep_transcripts: bool,
 }
 
 /// Run the comparison with real Claude Code sessions.
@@ -526,6 +536,15 @@ pub fn run(
         .trim()
         .to_string();
     let exe = paths::exe();
+    let transcripts = opts.keep_transcripts.then(|| {
+        project
+            .bench_dir()
+            .join("transcripts")
+            .join(chrono::Local::now().format("%Y%m%d-%H%M%S").to_string())
+    });
+    if let Some(d) = &transcripts {
+        std::fs::create_dir_all(d)?;
+    }
     let scratch = std::env::temp_dir().join(format!("local-brain-bench-{}", std::process::id()));
     std::fs::create_dir_all(&scratch)?;
     let tasks: Vec<&Task> = ts
@@ -613,6 +632,10 @@ pub fn run(
                 opts.max_turns,
                 opts.timeout_s,
                 opts.isolate,
+                transcripts
+                    .as_ref()
+                    .map(|d| d.join(format!("{}-{}-r{}.jsonl", config, t.id, run + 1)))
+                    .as_deref(),
             );
             r.run = run;
             eprintln!(
