@@ -756,10 +756,30 @@ pub fn spawn_ingest(project: &Project, transcript: &str, session: &str) {
     }
 }
 
-/// Prompts that are not a task: confirmations, slash commands, very short replies.
+/// Tags Claude Code wraps around prompts it generates itself (background-task and monitor
+/// notifications, local command output, slash-command echoes). They reach UserPromptSubmit like
+/// a typed prompt but nobody asked for code context.
+const MACHINE_PROMPT_TAGS: &[&str] = &[
+    "<task-notification>",
+    "<system-reminder>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<local-command-caveat>",
+    "<command-name>",
+    "<command-message>",
+    "<bash-input>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+];
+
+/// Prompts that are not a task: confirmations, slash commands, very short replies, and
+/// prompts Claude Code generated itself.
 fn is_task_prompt(prompt: &str) -> bool {
     let p = prompt.trim();
     if p.starts_with('/') || p.starts_with('!') || p.starts_with('#') {
+        return false;
+    }
+    if MACHINE_PROMPT_TAGS.iter().any(|t| p.starts_with(t)) {
         return false;
     }
     let words = p.split_whitespace().count();
@@ -1142,6 +1162,16 @@ mod tests {
         assert!(!is_task_prompt("evet devam et"));
         assert!(!is_task_prompt("/mcp"));
         assert!(!is_task_prompt("fix it"));
+        assert!(!is_task_prompt(
+            "<task-notification>\n<task-id>bqw4cyox5</task-id>\n<summary>Monitor event: \"model processes + memory pressure\"</summary>"
+        ));
+        assert!(!is_task_prompt(
+            "<local-command-stdout>Compacted conversation summary of the session</local-command-stdout>"
+        ));
+        // Pasted markup from the user is still a task.
+        assert!(is_task_prompt(
+            "<div class=\"card\"> this card overflows on mobile, fix the admin layout"
+        ));
     }
 
     #[test]

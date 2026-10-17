@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- The per-prompt context note was also added to prompts Claude Code generates itself
+  (background-task and monitor notifications, local command output), about 450 tokens each
+  that nobody asked for; in one long session these were most of the note's cost. They are now
+  skipped; typed prompts, including pasted markup, still get the note.
+
 ## [0.1.6] - 2026-10-18
 
 ### Added
