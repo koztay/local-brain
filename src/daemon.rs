@@ -430,6 +430,41 @@ pub fn install_service() -> Result<String> {
     }
 }
 
+/// The binary an installed daemon service starts, if a service is installed.
+fn service_binary() -> Option<String> {
+    if cfg!(target_os = "macos") {
+        let p = dirs::home_dir()?.join("Library/LaunchAgents/dev.local-brain.daemon.plist");
+        let s = std::fs::read_to_string(p).ok()?;
+        let start = s.find("<key>ProgramArguments</key><array><string>")?
+            + "<key>ProgramArguments</key><array><string>".len();
+        let end = start + s[start..].find("</string>")?;
+        Some(s[start..end].to_string())
+    } else if cfg!(target_os = "linux") {
+        let p = dirs::config_dir()?.join("systemd/user/local-brain.service");
+        let s = std::fs::read_to_string(p).ok()?;
+        let line = s.lines().find(|l| l.starts_with("ExecStart="))?;
+        Some(
+            line["ExecStart=".len()..]
+                .trim_end_matches(" daemon run")
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+/// Re-install the daemon service when it points at a binary that no longer exists.
+pub fn repair_stale_service(exe: &str) -> Option<String> {
+    let b = service_binary()?;
+    if b == exe || Path::new(&b).exists() {
+        return None;
+    }
+    Some(match install_service() {
+        Ok(_) => format!("updated the daemon service to {}", exe),
+        Err(e) => format!("could not update the daemon service: {:#}", e),
+    })
+}
+
 pub fn uninstall_service() -> Result<String> {
     let _ = stop();
     if cfg!(target_os = "macos") {

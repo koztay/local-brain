@@ -70,6 +70,72 @@ fn is_ours(hook: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// The binary path at the start of one of our hook commands (`<exe> hook <event>`).
+fn hook_binary(cmd: &str) -> Option<String> {
+    let exe = &cmd[..cmd.rfind(" hook ")?];
+    Some(
+        match exe.strip_prefix('\'').and_then(|e| e.strip_suffix('\'')) {
+            Some(q) => q.replace("'\\''", "'"),
+            None => exe.to_string(),
+        },
+    )
+}
+
+/// Every binary path the Claude Code integration of `project` points at (hooks and MCP).
+fn registered_binaries(project: &Project) -> Vec<String> {
+    let mut out: Vec<String> = ClaudeCode::mcp_registered(project).into_iter().collect();
+    if let Ok(s) = read_json(&ClaudeCode::settings_path(project)) {
+        if let Some(hooks) = s["hooks"].as_object() {
+            for groups in hooks.values() {
+                for g in groups.as_array().into_iter().flatten() {
+                    for h in g["hooks"].as_array().into_iter().flatten() {
+                        if is_ours(h) {
+                            if let Some(b) = h["command"].as_str().and_then(hook_binary) {
+                                out.push(b);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out.retain(|b| !b.is_empty());
+    out.dedup();
+    out
+}
+
+/// Re-install the Claude Code integration in registered projects whose hooks or MCP entry point
+/// at a binary that no longer exists — e.g. the versioned Homebrew path removed by an upgrade.
+/// Integrations that point at another existing binary (a dev build) are left alone.
+pub fn repair_stale(exe: &str) -> Vec<String> {
+    let mut msgs = Vec::new();
+    for entry in crate::registry::load() {
+        if !entry.root.is_dir() {
+            continue;
+        }
+        let project = Project::new(entry.root.clone());
+        let stale = registered_binaries(&project)
+            .iter()
+            .any(|b| b != exe && !Path::new(b).exists());
+        if !stale {
+            continue;
+        }
+        match ClaudeCode.install(&project, exe) {
+            Ok(_) => msgs.push(format!(
+                "updated the Claude Code integration in {} to {}",
+                entry.root.display(),
+                exe
+            )),
+            Err(e) => msgs.push(format!(
+                "could not update the integration in {}: {:#} (run `local-brain init` there)",
+                entry.root.display(),
+                e
+            )),
+        }
+    }
+    msgs
+}
+
 fn hook_entry(exe: &str, event: &str, timeout: u64, matcher: Option<&str>) -> Value {
     let cmd = format!("{} hook {}", crate::util::sh_quote(exe), event);
     let mut v = json!({"hooks": [{"type": "command", "command": cmd, "timeout": timeout}]});
@@ -431,6 +497,19 @@ impl Agent for Codex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_binary_parsing() {
+        assert_eq!(
+            hook_binary("/opt/homebrew/bin/local-brain hook stop").as_deref(),
+            Some("/opt/homebrew/bin/local-brain")
+        );
+        assert_eq!(
+            hook_binary("'/Users/a b/bin/local-brain' hook pre-tool-use").as_deref(),
+            Some("/Users/a b/bin/local-brain")
+        );
+        assert_eq!(hook_binary("echo user"), None);
+    }
 
     #[test]
     fn install_and_uninstall_roundtrip() {

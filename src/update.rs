@@ -143,6 +143,17 @@ pub fn notify() {
     spawn_refresh_if_stale(&cache);
 }
 
+/// Point project integrations and the daemon service at this binary when their recorded path
+/// disappeared (Homebrew deletes the old version's folder on upgrade). Cheap: a few JSON reads.
+pub fn repair() {
+    let exe = paths::exe();
+    let mut msgs = crate::integrate::repair_stale(&exe);
+    msgs.extend(daemon::repair_stale_service(&exe));
+    for m in msgs {
+        ok(&m);
+    }
+}
+
 /// `init` checks synchronously (briefly) and offers to update before setting anything up.
 /// Returns true when it updated, so the caller can stop and ask for a re-run.
 pub fn offer_in_init(yes: bool) -> bool {
@@ -209,6 +220,8 @@ pub fn update(force: bool) -> Result<()> {
         return Ok(());
     }
     let real = std::env::current_exe()?.canonicalize()?;
+    // Resolve before upgrading: Homebrew removes this version's folder during the upgrade.
+    let stable = paths::exe();
     if is_newer(&latest, CURRENT) {
         eprintln!("Updating local-brain {} → {}…", CURRENT, latest);
     } else if latest == CURRENT {
@@ -219,6 +232,8 @@ pub fn update(force: bool) -> Result<()> {
     match install_method(&real) {
         Method::Homebrew => {
             let formula = format!("{}/local-brain", REPO);
+            // `brew upgrade` alone does not refresh third-party taps; fetch the new formula first.
+            run("brew", &["update", "--quiet"])?;
             if force {
                 run("brew", &["reinstall", &formula])?;
             } else {
@@ -239,8 +254,27 @@ pub fn update(force: bool) -> Result<()> {
         )?,
         Method::Direct(path) => replace_binary(&path, &latest)?,
     }
+    // Trust the installed binary, not the package manager's exit code.
+    let installed = Command::new(&stable)
+        .arg("--version")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    if installed.rsplit(' ').next() != Some(latest.as_str()) {
+        bail!(
+            "the update did not install {} ({} reports `{}`)",
+            latest,
+            stable,
+            installed
+        );
+    }
     ok(&format!("updated to local-brain {}", latest));
-    restart_daemon();
+    // Let the new binary re-point integrations and restart the daemon.
+    let _ = Command::new(&stable)
+        .arg("__post-update")
+        .env("LOCAL_BRAIN_NO_UPDATE_CHECK", "1")
+        .status();
     Ok(())
 }
 
@@ -254,6 +288,12 @@ fn run(program: &str, args: &[&str]) -> Result<()> {
         bail!("`{} {}` failed ({})", program, args.join(" "), status);
     }
     Ok(())
+}
+
+/// Hidden `__post-update`, run by the freshly installed binary.
+pub fn post_update() {
+    repair();
+    restart_daemon();
 }
 
 /// The running daemon is still the old binary; restart it so it picks up the new one.

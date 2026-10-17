@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.2] - 2026-10-17
+
+### Fixed
+- `local-brain update` on Homebrew runs `brew update` first; `brew upgrade` alone does not
+  refresh third-party taps, so it reported nothing to upgrade.
+- `update` checks the version of the binary it installed instead of trusting the package
+  manager's exit status.
+- Projects whose Claude Code hooks or MCP entry point at a binary that no longer exists (for
+  example the 0.1.0 Homebrew path removed by `brew upgrade`) are re-pointed automatically by the
+  next interactive command or update; the daemon service is repaired the same way.
+
 ## [0.1.1] - 2026-10-17
 
 ### Added
@@ -21,8 +32,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 - Homebrew installs register the stable `<prefix>/bin/local-brain` path for hooks, MCP and the
-  daemon instead of the versioned Cellar path that `brew upgrade` deletes. Run `local-brain init`
-  once in projects set up with 0.1.0.
+  daemon instead of the versioned Cellar path that `brew upgrade` deletes.
 
 ### Changed
 - The release workflow updates the Homebrew formula automatically.

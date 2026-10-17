@@ -235,6 +235,9 @@ enum Cmd {
     /// Refresh the cached latest-release check (run in the background)
     #[command(name = "__update-check", hide = true)]
     UpdateCheck,
+    /// Re-point integrations and restart the daemon after an update
+    #[command(name = "__post-update", hide = true)]
+    PostUpdate,
 }
 
 #[derive(Subcommand)]
@@ -327,6 +330,9 @@ fn main() {
             | Cmd::Doctor { .. }
             | Cmd::Memory { .. }
     );
+    if interactive {
+        update::repair();
+    }
     match real_main(cli) {
         Ok(code) => {
             if interactive {
@@ -660,6 +666,7 @@ fn real_main(cli: Cli) -> Result<i32> {
         Cmd::Hook { event } => hooks::run(&event)?,
         Cmd::Update { force } => update::update(force)?,
         Cmd::UpdateCheck => update::refresh(),
+        Cmd::PostUpdate => update::post_update(),
     }
     Ok(0)
 }
