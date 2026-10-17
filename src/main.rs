@@ -27,6 +27,7 @@ mod secrets;
 mod settings;
 mod setup;
 mod slice;
+mod statusline;
 mod store;
 mod summarize;
 mod update;
@@ -218,6 +219,12 @@ enum Cmd {
     Config {
         #[command(subcommand)]
         cmd: Option<ConfigCmd>,
+    },
+    /// Status-line segment for Claude Code: tokens saved this session and today (reads the
+    /// status-line JSON on stdin). `--install` sets it as the status line if none is configured
+    Statusline {
+        #[arg(long)]
+        install: bool,
     },
     /// Tune memory and background settings to this machine's RAM (shows the changes first)
     Optimize {
@@ -678,6 +685,13 @@ fn real_main(cli: Cli) -> Result<i32> {
             ConfigCmd::Set { key, value } => settings::set(&key, &value)?,
             ConfigCmd::Reset { key } => settings::reset(&key)?,
         },
+        Cmd::Statusline { install } => {
+            if install {
+                statusline::install()?
+            } else {
+                statusline::print()
+            }
+        }
         Cmd::Optimize { dry_run, yes } => settings::optimize(dry_run, yes)?,
         Cmd::Daemon { cmd } => match cmd {
             DaemonCmd::Run => daemon::run()?,

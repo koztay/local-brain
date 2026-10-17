@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `local-brain statusline`: shows in Claude Code's status line how many tokens local-brain
+  saved in the current session and today, or what it cost when context notes outweighed the
+  savings. ~10 ms per refresh; prints nothing outside a local-brain project. `--install` sets it
+  as the status line only when none is configured, and otherwise prints the line to add to your
+  own script.
+
 ### Fixed
 - The per-prompt context note was also added to prompts Claude Code generates itself
   (background-task and monitor notifications, local command output), about 450 tokens each

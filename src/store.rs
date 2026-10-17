@@ -764,6 +764,15 @@ impl Store {
         )?)
     }
 
+    /// (calls, baseline tokens, actual tokens) recorded for one Claude Code session.
+    pub fn metric_totals_for_session(&self, session: &str) -> Result<(i64, i64, i64)> {
+        Ok(self.conn.query_row(
+            "SELECT count(*), coalesce(sum(baseline_tokens), 0), coalesce(sum(actual_tokens), 0) FROM metrics WHERE session_id = ?",
+            [session],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?)
+    }
+
     pub fn metric_breakdown(&self, since: i64) -> Result<Vec<(String, i64, i64, i64)>> {
         let mut st = self.conn.prepare(
             "SELECT kind, count(*), sum(baseline_tokens), sum(actual_tokens) FROM metrics
