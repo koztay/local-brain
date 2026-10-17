@@ -4,26 +4,26 @@
 class LocalBrain < Formula
   desc "Local helper brain for coding agents: code graph, search, summaries and compression"
   homepage "https://github.com/koztay/local-brain"
-  version "0.1.5"
+  version "0.1.6"
   license "Apache-2.0"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/koztay/local-brain/releases/download/v0.1.5/local-brain-aarch64-apple-darwin.tar.gz"
-      sha256 "2aa1cedb27e3339f0e041418582ad79e5e55602858a7fc0dcd84312574cc2d1b"
+      url "https://github.com/koztay/local-brain/releases/download/v0.1.6/local-brain-aarch64-apple-darwin.tar.gz"
+      sha256 "a1a1eabd4f2553b2e03887b93cb4dc8e04afa69480996ec2c43e0eb68c4733c9"
     else
-      url "https://github.com/koztay/local-brain/releases/download/v0.1.5/local-brain-x86_64-apple-darwin.tar.gz"
-      sha256 "a60e7e2221b933a7bc4787e322db2a4e11945ab0c14b18671d58edc2ebf234d4"
+      url "https://github.com/koztay/local-brain/releases/download/v0.1.6/local-brain-x86_64-apple-darwin.tar.gz"
+      sha256 "fe8141aaf90a5287021a9a02f21e568e4f3ed45bc3a7dec9a8051ec49118ee0f"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
-      url "https://github.com/koztay/local-brain/releases/download/v0.1.5/local-brain-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "4c1cefdf67478a89b4aec7f4ca8da5aef742ab26e59675460a8eff50847e8e48"
+      url "https://github.com/koztay/local-brain/releases/download/v0.1.6/local-brain-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "f4d4e28cd320634ae8e34657bf3c8e079acb5d1dd6ec8091d0a534a1fbd5611e"
     else
-      url "https://github.com/koztay/local-brain/releases/download/v0.1.5/local-brain-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "aae9092822cb9c004ac8ec2a5430929711d24469efbc8127a9f1717eabca9a2d"
+      url "https://github.com/koztay/local-brain/releases/download/v0.1.6/local-brain-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "985255ccc7189077a01ebe8e7f933fd7bc91d37dd2664b3f066fc87d6750b54f"
     end
   end
 
