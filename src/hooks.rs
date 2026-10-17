@@ -4,6 +4,8 @@
 //! * PreToolUse Grep/Glob — oversized result sets are ranked with the graph and trimmed.
 //! * PostToolUse Bash — long test/build/log output is compressed (`updatedToolOutput`).
 //! * SessionStart — a short project brief is injected.
+//! * UserPromptSubmit — the files most relevant to the prompt are added as context, so Claude
+//!   starts from the right code instead of exploring.
 //! * Stop / SessionEnd — the session is summarized into memory in the background.
 //!
 //! Escape hatch: a blocked Read/Grep/Glob is allowed when Claude repeats the same call.
@@ -88,13 +90,19 @@ pub fn handle(event: &str, v: &Value) -> Result<Option<Value>> {
         ("session-start", _) if cfg.hooks.session_brief => {
             session_start(&project, &cfg, &store, &session)
         }
+        ("user-prompt-submit", _) if cfg.hooks.prompt_context => {
+            prompt_context(&cfg, &store, &session, v["prompt"].as_str().unwrap_or(""))
+        }
         ("stop", _) if cfg.hooks.session_memory => {
             remember_pending(&store, &session, v["transcript_path"].as_str())?;
             Ok(None)
         }
         ("session-end", _) if cfg.hooks.session_memory => {
             if let Some(t) = v["transcript_path"].as_str() {
-                spawn_ingest(&project, t, &session);
+                // Claude Code writes no transcript for a session without messages.
+                if Path::new(t).is_file() {
+                    spawn_ingest(&project, t, &session);
+                }
                 forget_pending(&store, &session)?;
             }
             Ok(None)
@@ -135,8 +143,16 @@ fn pre_read(
         return Ok(None);
     };
     let abs = PathBuf::from(fp);
-    if !abs.starts_with(&project.root) || !abs.is_file() {
+    if !abs.is_file() {
         return Ok(None);
+    }
+    if !abs.starts_with(&project.root) {
+        // Outside the project only images/PDFs are handled (screenshots in ~/Desktop, …).
+        let name = abs.to_string_lossy();
+        let doc = crate::docs::is_image(&name) || crate::docs::is_pdf(&name);
+        if !(doc && cfg.hooks.read_docs && cfg.hooks.read_outside_docs) {
+            return Ok(None);
+        }
     }
     let rel = project.rel(&abs);
     let key = format!("read:{}", rel);
@@ -692,6 +708,344 @@ pub fn spawn_ingest(project: &Project, transcript: &str, session: &str) {
     }
 }
 
+/// Prompts that are not a task: confirmations, slash commands, very short replies.
+fn is_task_prompt(prompt: &str) -> bool {
+    let p = prompt.trim();
+    if p.starts_with('/') || p.starts_with('!') || p.starts_with('#') {
+        return false;
+    }
+    let words = p.split_whitespace().count();
+    if words < 3 || p.chars().count() < 15 {
+        return false;
+    }
+    let lower = p.to_lowercase();
+    let filler = [
+        "yes",
+        "no",
+        "ok",
+        "okay",
+        "continue",
+        "go ahead",
+        "proceed",
+        "thanks",
+        "thank you",
+        "evet",
+        "hayır",
+        "tamam",
+        "devam",
+        "teşekkürler",
+    ];
+    !(words <= 4 && filler.iter().any(|f| lower.starts_with(f)))
+}
+
+/// Generic task words that say nothing about *where* in the code to look.
+const TASK_WORDS: &[&str] = &[
+    "need",
+    "needs",
+    "improve",
+    "analyze",
+    "analyse",
+    "make",
+    "look",
+    "looks",
+    "looking",
+    "page",
+    "pages",
+    "file",
+    "files",
+    "code",
+    "component",
+    "components",
+    "their",
+    "them",
+    "this",
+    "that",
+    "with",
+    "from",
+    "should",
+    "please",
+    "want",
+    "into",
+    "also",
+    "like",
+    "update",
+    "change",
+    "better",
+    "work",
+    "working",
+    "using",
+    "add",
+    "create",
+    "implement",
+    "feature",
+    "screen",
+    "view",
+    "fix",
+    "bug",
+    "issue",
+    "make",
+    "some",
+    "more",
+    "less",
+    "every",
+    "each",
+    "there",
+    "where",
+    "what",
+    "when",
+    "which",
+    "while",
+    "have",
+    "does",
+    "about",
+    "then",
+    "than",
+];
+
+/// Words of a prompt that may name a place in the code ("admin", "checkout", "auth").
+fn place_terms(prompt: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in prompt
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|w| w.to_lowercase())
+    {
+        if w.chars().count() >= 4 && !TASK_WORDS.contains(&w.as_str()) && !out.contains(&w) {
+            out.push(w);
+        }
+    }
+    out
+}
+
+/// A directory name matches a term when it contains it, or when the term is the name plus a
+/// suffix (Turkish "panelinin" → "panel").
+fn segment_matches(seg: &str, term: &str) -> bool {
+    let seg = seg.to_lowercase();
+    let seg = seg.trim_matches(|c: char| !c.is_alphanumeric());
+    seg.chars().count() >= 4 && (seg.contains(term) || term.starts_with(seg))
+}
+
+fn is_test_path(p: &str) -> bool {
+    let l = p.to_lowercase();
+    l.contains("test") || l.contains("spec") || l.contains("e2e") || l.contains("__mocks__")
+}
+
+struct Area {
+    dir: String,
+    files: usize,
+    children: Vec<String>,
+}
+
+/// Directories whose name matches a prompt term, with how much code they hold.
+fn matching_areas(store: &Store, terms: &[String]) -> Result<Vec<Area>> {
+    let files = store.files()?;
+    let code: Vec<&str> = files
+        .iter()
+        .filter(|f| f.kind == "code" && !is_test_path(&f.path))
+        .map(|f| f.path.as_str())
+        .collect();
+    let mut count: std::collections::BTreeMap<String, usize> = Default::default();
+    for path in &code {
+        let parts: Vec<&str> = path.split('/').collect();
+        for depth in 1..parts.len() {
+            let seg = parts[depth - 1];
+            if terms.iter().any(|t| segment_matches(seg, t)) {
+                *count.entry(parts[..depth].join("/")).or_default() += 1;
+            }
+        }
+    }
+    // Keep the outermost matching directory of each nest.
+    let dirs: Vec<String> = count.keys().cloned().collect();
+    let mut areas: Vec<Area> = dirs
+        .iter()
+        .filter(|d| {
+            !dirs
+                .iter()
+                .any(|o| o != *d && d.starts_with(&format!("{}/", o)))
+        })
+        .map(|d| {
+            let prefix = format!("{}/", d);
+            let mut children: Vec<String> = Vec::new();
+            for path in &code {
+                if let Some(rest) = path.strip_prefix(&prefix) {
+                    let child = match rest.split_once('/') {
+                        Some((dir, _)) => format!("{}/", dir),
+                        None => rest.to_string(),
+                    };
+                    if !children.contains(&child) {
+                        children.push(child);
+                    }
+                }
+            }
+            children.sort_by_key(|c| (!c.ends_with('/'), c.clone()));
+            Area {
+                dir: d.clone(),
+                files: count[d],
+                children,
+            }
+        })
+        .collect();
+    areas.sort_by_key(|a| std::cmp::Reverse(a.files));
+    areas.truncate(3);
+    Ok(areas)
+}
+
+/// UserPromptSubmit: tell Claude where the code for this request lives — matching areas of the
+/// tree, the most relevant code files with key symbols, then related docs — within
+/// `prompt_context_tokens`.
+fn prompt_context(
+    cfg: &Config,
+    store: &Store,
+    session: &str,
+    prompt: &str,
+) -> Result<Option<Value>> {
+    if !is_task_prompt(prompt) || store.meta("last_learn")?.is_none() {
+        return Ok(None);
+    }
+    let mut c = cfg.clone();
+    // Embedding the prompt must not hold the user up; lexical search still works without it.
+    c.runtime.timeout_secs = c.runtime.timeout_secs.min(8);
+    let q = util::clip(prompt, 2000);
+    let hits = crate::query::search(store, &c, &q, None, &[], 40)?;
+    let areas = matching_areas(store, &place_terms(&q))?;
+    if hits.is_empty() && areas.is_empty() {
+        return Ok(None);
+    }
+
+    // Files ranked by their chunks' scores, with up to two key symbols each.
+    let mut order: Vec<String> = Vec::new();
+    let mut score: std::collections::HashMap<String, f32> = Default::default();
+    let mut syms: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for (ch, s) in &hits {
+        if !order.contains(&ch.path) {
+            order.push(ch.path.clone());
+        }
+        *score.entry(ch.path.clone()).or_default() += s;
+        let e = syms.entry(ch.path.clone()).or_default();
+        if e.len() < 2 {
+            let label = match &ch.symbol {
+                Some(sym) => format!("`{}` ({}-{})", sym, ch.start_line, ch.end_line),
+                None => format!("lines {}-{}", ch.start_line, ch.end_line),
+            };
+            if !e.contains(&label) {
+                e.push(label);
+            }
+        }
+    }
+    order.sort_by(|a, b| {
+        score[b]
+            .partial_cmp(&score[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let kind_of: std::collections::HashMap<String, String> = store
+        .files()?
+        .into_iter()
+        .map(|f| (f.path, f.kind))
+        .collect();
+    let in_area = |p: &str| areas.iter().any(|a| p.starts_with(&format!("{}/", a.dir)));
+    let code: Vec<&String> = order
+        .iter()
+        .filter(|p| kind_of.get(*p).map(|k| k == "code").unwrap_or(false))
+        .filter(|p| !is_test_path(p))
+        .collect();
+    let docs: Vec<&String> = order
+        .iter()
+        .filter(|p| kind_of.get(*p).map(|k| k != "code").unwrap_or(false))
+        .collect();
+
+    let budget = cfg.hooks.prompt_context_tokens.max(150);
+    let mut out = String::from(
+        "local-brain context (local index of this repo): where the code for this request lives. \
+         Start from here; use `brain_query` to find more and `brain_slice` to read one symbol \
+         instead of whole files.\n",
+    );
+    let fits = |out: &str, line: &str| util::tokens(out) + util::tokens(line) <= budget;
+    let mut shown = 0;
+    let file_line = |path: &str| -> Result<String> {
+        let summary = store
+            .summary("file", path)?
+            .map(|(t, ..)| util::clip(&t.replace('\n', " "), 160))
+            .unwrap_or_default();
+        Ok(format!(
+            "- {} — {}{}\n",
+            path,
+            summary,
+            syms.get(path)
+                .filter(|v| !v.is_empty())
+                .map(|v| format!(" Key: {}.", v.join(", ")))
+                .unwrap_or_default()
+        ))
+    };
+
+    for a in &areas {
+        let summary = store
+            .summary("module", &a.dir)?
+            .map(|(t, ..)| t.lines().next().unwrap_or("").to_string())
+            .map(|t| util::clip(&t, 160))
+            .unwrap_or_default();
+        let mut kids = a.children.clone();
+        let more = kids.len().saturating_sub(16);
+        kids.truncate(16);
+        let line = format!(
+            "- area {}/ ({} code files) — {} Contains: {}{}\n",
+            a.dir,
+            a.files,
+            summary,
+            kids.join(", "),
+            if more > 0 {
+                format!(", +{} more", more)
+            } else {
+                String::new()
+            }
+        );
+        if fits(&out, &line) {
+            out.push_str(&line);
+            shown += 1;
+        }
+    }
+    let best = code.first().map(|p| score[*p]).unwrap_or(0.0);
+    for (i, path) in code.iter().filter(|p| !in_area(p)).take(5).enumerate() {
+        if i >= 2 && score[*path] < best * 0.35 {
+            break;
+        }
+        let line = file_line(path)?;
+        if !fits(&out, &line) {
+            break;
+        }
+        out.push_str(&line);
+        shown += 1;
+    }
+    // Inside a matching area, the best few files are still worth naming.
+    for path in code.iter().filter(|p| in_area(p)).take(3) {
+        let line = file_line(path)?;
+        if !fits(&out, &line) {
+            break;
+        }
+        out.push_str(&line);
+        shown += 1;
+    }
+    for path in docs.iter().take(2) {
+        let line = file_line(path)?.replacen("- ", "- doc ", 1);
+        if !fits(&out, &line) {
+            break;
+        }
+        out.push_str(&line);
+        shown += 1;
+    }
+    if shown == 0 {
+        return Ok(None);
+    }
+    store.record_metric(
+        "hook",
+        "prompt_context",
+        0,
+        util::tokens(&out),
+        Some(session),
+    )?;
+    Ok(Some(json!({
+        "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": out}
+    })))
+}
+
 fn session_start(
     project: &Project,
     cfg: &Config,
@@ -701,7 +1055,7 @@ fn session_start(
     // Sessions that ended without SessionEnd (e.g. a closed terminal) are summarized now.
     for (sid, path) in pending(store) {
         if sid != session {
-            if let Some(p) = path.as_str() {
+            if let Some(p) = path.as_str().filter(|p| Path::new(p).is_file()) {
                 spawn_ingest(project, p, &sid);
             }
             forget_pending(store, &sid)?;
@@ -726,6 +1080,32 @@ fn session_start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_prompts_are_recognised() {
+        assert!(is_task_prompt(
+            "We need to improve the admin panel looking, analyze the pages"
+        ));
+        assert!(is_task_prompt(
+            "admin panelinin görünümünü iyileştirelim lütfen"
+        ));
+        assert!(!is_task_prompt("yes"));
+        assert!(!is_task_prompt("ok go ahead"));
+        assert!(!is_task_prompt("evet devam et"));
+        assert!(!is_task_prompt("/mcp"));
+        assert!(!is_task_prompt("fix it"));
+    }
+
+    #[test]
+    fn place_terms_and_segments() {
+        let t = place_terms("We need to improve the admin panel looking, analyze the pages");
+        assert_eq!(t, vec!["admin", "panel"]);
+        assert!(segment_matches("admin", "admin"));
+        assert!(segment_matches("[locale]", "locale"));
+        assert!(segment_matches("panel", "panelinin"));
+        assert!(!segment_matches("app", "application"));
+        assert!(is_test_path("apps/web/e2e/admin.spec.ts"));
+    }
 
     #[test]
     fn bash_factors() {

@@ -238,18 +238,23 @@ before it continues. Hooks, the MCP server and the daemon never print it. Turn i
 
    | Event | Behavior |
    |---|---|
-   | `PreToolUse` Read on images/PDFs | Read locally (vision model / PDF text). Claude gets the text; no image tokens. |
+   | `PreToolUse` Read on images/PDFs | Read locally (vision model / PDF text), in the project and outside it (e.g. a screenshot in `~/Desktop`). Claude gets the text; no image tokens. Images pasted into the prompt go straight to Claude and cannot be intercepted. |
    | `PreToolUse` Read on large files | Returns an outline (signatures + line ranges) and suggests `brain_slice` / `offset`+`limit`. |
    | `PreToolUse` Grep / Glob | When results exceed the threshold: ranked top results (definitions first, tests and generated files last) + `raw_id`. |
    | `PostToolUse` Bash | Long output is compressed (`updatedToolOutput`). Error/warning lines, stack traces, failing test names and exit codes are never removed. Read-like commands (`cat`, `git diff`, …) are left alone unless enormous. |
    | `SessionStart` | A brief of ≤ ~500 tokens: overview, entry points, recent decisions, open tasks, last session. |
+   | `UserPromptSubmit` | For task prompts, a note of ≤ ~600 tokens on where the code lives: matching areas of the tree (e.g. `app/admin/` with its sections), the most relevant files with key symbols, then related docs. Confirmations and slash commands are skipped. |
    | `Stop` / `SessionEnd` | The transcript is summarized locally into memory in the background (decisions, changed files, open tasks). |
 
    **Escape hatch:** when a hook replaces a Read/Grep/Glob result, Claude can simply repeat the
    identical call and it goes through unchanged. Hooks never break the agent: on any internal
    error they stay silent (logged to `~/.local-brain/logs/hooks.log`).
-3. **`CLAUDE.md`** gets a short, marked section asking Claude to use `brain_query` first and
-   `brain_slice` before editing.
+3. **`CLAUDE.md`** gets a short, marked section asking Claude to use local-brain for every task:
+   start from the prompt's context note or `brain_query`, and read single symbols with
+   `brain_slice` instead of whole files.
+
+After an update, the next command you run refreshes these hooks and the `CLAUDE.md` section in
+every project, so new behaviour arrives without re-running `init`.
 
 ### MCP tools
 

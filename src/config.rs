@@ -73,12 +73,17 @@ pub struct HooksCfg {
     pub glob: bool,
     pub session_brief: bool,
     pub session_memory: bool,
+    /// Add the most relevant files to each prompt (UserPromptSubmit).
+    pub prompt_context: bool,
+    /// Read images/PDFs outside the project (e.g. ~/Desktop screenshots) locally too.
+    pub read_outside_docs: bool,
     pub large_file_lines: usize,
     pub large_file_tokens: i64,
     pub grep_max_results: usize,
     pub grep_show: usize,
     pub glob_max_results: usize,
     pub brief_tokens: i64,
+    pub prompt_context_tokens: i64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -168,12 +173,15 @@ impl Default for HooksCfg {
             glob: true,
             session_brief: true,
             session_memory: true,
+            prompt_context: true,
+            read_outside_docs: true,
             large_file_lines: 600,
             large_file_tokens: 8000,
             grep_max_results: 80,
             grep_show: 30,
             glob_max_results: 200,
             brief_tokens: 500,
+            prompt_context_tokens: 600,
         }
     }
 }

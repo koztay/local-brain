@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.4] - 2026-10-17
+
+### Added
+- Per-prompt context (`UserPromptSubmit` hook): for task prompts ("improve the admin panel's
+  look") local-brain adds a short note on where the code lives — matching areas of the tree with
+  their sections, the most relevant code files with key symbols, then related docs — so Claude
+  starts from the right files instead of exploring. Works for prompts in other languages too
+  (directory names match word stems, e.g. "panelinin" → `panel/`). Skips confirmations and
+  slash commands. `[hooks] prompt_context`, `prompt_context_tokens`.
+- Images and PDFs outside the project (e.g. `~/Desktop/Screenshot.png`) are read locally as well
+  when Claude opens them (`[hooks] read_outside_docs`). Images pasted into the prompt still go
+  directly to Claude; no hook can intercept them.
+
+### Changed
+- The `CLAUDE.md` section asks Claude to use local-brain for every task, not only for questions.
+- Existing projects get new hooks and the updated `CLAUDE.md` section automatically on the
+  first command after an update.
+
+### Fixed
+- Session memory: sessions without a transcript (Claude Code writes none for a session without
+  messages) no longer log an ingest error.
+
 ## [0.1.3] - 2026-10-17
 
 ### Changed

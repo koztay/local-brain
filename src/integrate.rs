@@ -37,10 +37,14 @@ const MD_END: &str = "<!-- local-brain:end -->";
 const CLAUDE_MD_SECTION: &str = "<!-- local-brain:start -->
 ## local-brain (local project brain)
 
-This project is indexed by local-brain, which runs on this machine and costs no cloud tokens.
-- For questions about the code (where is X, who calls X, how does Y work), use `brain_query` before Grep/Read.
-- Before editing, fetch only the code you need with `brain_slice` (a symbol or a line range) instead of reading whole files.
-- Read images and PDFs with `brain_doc`.
+This project is indexed by local-brain, a local index of this codebase that costs no cloud
+tokens. Use it for every task (features, fixes, refactors, reviews), not only for questions:
+- Prompts may arrive with a \"local-brain context\" note listing the most relevant files. Start there.
+- To locate code for a task, ask `brain_query` (e.g. \"admin panel pages and their layout components\")
+  before exploring with Glob/Grep/Read.
+- Read only what you need with `brain_slice` (one symbol or a line range). Read a whole file only
+  when you are about to change most of it.
+- Image and PDF files are read locally: use `brain_doc` (or Read, which local-brain intercepts).
 - Long command outputs are compressed; get the full text with `brain_raw` and the given `raw_id`.
 - Record important technical decisions with `brain_memory` (action `note`).
 <!-- local-brain:end -->
@@ -114,17 +118,20 @@ pub fn repair_stale(exe: &str) -> Vec<String> {
             continue;
         }
         let project = Project::new(entry.root.clone());
-        let stale = registered_binaries(&project)
-            .iter()
-            .any(|b| b != exe && !Path::new(b).exists());
-        if !stale {
+        let bins = registered_binaries(&project);
+        if bins.is_empty() {
+            continue; // set up with --no-agent
+        }
+        let stale = bins.iter().any(|b| b != exe && !Path::new(b).exists());
+        // A newer local-brain may add hooks or change the CLAUDE.md section.
+        let outdated = !ClaudeCode::is_current(&project);
+        if !stale && !outdated {
             continue;
         }
         match ClaudeCode.install(&project, exe) {
             Ok(_) => msgs.push(format!(
-                "updated the Claude Code integration in {} to {}",
-                entry.root.display(),
-                exe
+                "updated the Claude Code integration in {}",
+                entry.root.display()
             )),
             Err(e) => msgs.push(format!(
                 "could not update the integration in {}: {:#} (run `local-brain init` there)",
@@ -239,6 +246,36 @@ impl ClaudeCode {
         Ok("registered MCP server in .mcp.json (claude CLI not found)".into())
     }
 
+    /// Hook events this version installs.
+    const EVENTS: [&'static str; 6] = [
+        "PreToolUse",
+        "PostToolUse",
+        "SessionStart",
+        "UserPromptSubmit",
+        "Stop",
+        "SessionEnd",
+    ];
+
+    /// True when every hook this version installs is present and CLAUDE.md has the current section.
+    fn is_current(project: &Project) -> bool {
+        let s = read_json(&Self::settings_path(project)).unwrap_or(json!({}));
+        let has = |ev: &str| {
+            s["hooks"][ev]
+                .as_array()
+                .map(|gs| {
+                    gs.iter().any(|g| {
+                        g["hooks"]
+                            .as_array()
+                            .map(|hs| hs.iter().any(is_ours))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
+        };
+        let md = std::fs::read_to_string(project.root.join("CLAUDE.md")).unwrap_or_default();
+        Self::EVENTS.iter().all(|e| has(e)) && md.contains(CLAUDE_MD_SECTION.trim_end())
+    }
+
     fn mcp_registered(project: &Project) -> Option<String> {
         if let Some(home) = dirs::home_dir() {
             if let Ok(v) = read_json(&home.join(".claude.json")) {
@@ -303,6 +340,11 @@ impl Agent for ClaudeCode {
             &mut s,
             "SessionStart",
             hook_entry(exe, "session-start", 20, None),
+        );
+        add(
+            &mut s,
+            "UserPromptSubmit",
+            hook_entry(exe, "user-prompt-submit", 15, None),
         );
         add(&mut s, "Stop", hook_entry(exe, "stop", 10, None));
         add(
@@ -448,7 +490,7 @@ impl Agent for ClaudeCode {
         events.sort();
         events.dedup();
         out.push(Check {
-            ok: events.len() >= 5 && !stale_exe,
+            ok: events.len() >= Self::EVENTS.len() && !stale_exe,
             label: "Claude Code hooks".into(),
             detail: if events.is_empty() {
                 "none installed — run `local-brain init`".into()
