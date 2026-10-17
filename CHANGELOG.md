@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.6] - 2026-10-18
+
+### Added
+- `local-brain config` lists every setting with its value, default, meaning and tuning notes;
+  `config set <section.key> <value>` / `config reset <key>` change one without editing TOML
+  (type- and range-checked; API keys are never printed).
+- `local-brain optimize` tunes the memory and background settings to the machine's RAM
+  (defaults are for 16 GB), shows the changes and asks before writing. Models are not switched;
+  a tier mismatch is pointed out with `init --reconfigure`.
+
+### Fixed
+- The background summary queue kept the local model loaded indefinitely (each request reset
+  `keep_alive`), which on 16 GB machines pushed macOS into many GB of swap on the system disk.
+  Background passes now back off under memory pressure and unload the model while waiting
+  (`[daemon] min_free_memory_pct`, default 15; pacing in `bg_*` settings). The idle unload also
+  works again after a background pass.
+
 ## [0.1.5] - 2026-10-17
 
 ### Security

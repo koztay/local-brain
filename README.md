@@ -211,6 +211,8 @@ A checklist to verify everything end to end (≈10 minutes):
 | `local-brain run -- <cmd>` | Run a command and print its output compressed; keeps the exit code. |
 | `local-brain raw <raw_id> [--grep re] [--range a-b]` | The full text behind a compressed output. |
 | `local-brain bench` | Benchmark vanilla / graphify / local-brain with real Claude Code sessions (`--offline` for an estimate). |
+| `local-brain config [list\|get\|set\|reset]` | Every setting with its value, default, meaning and RAM tuning notes; `set daemon.bg_pace_secs 30` changes one (type- and range-checked), `reset` restores the default, `list --changed` shows only your changes. |
+| `local-brain optimize` | Tune memory and background settings to this machine's RAM (defaults are for 16 GB). Shows the changes and asks first; `--dry-run`, `--yes`. Never switches models. |
 | `local-brain doctor` | Check runtime, models, database, hooks and MCP. `--set-provider ollama\|lmstudio\|mlx\|llamacpp\|openai\|none [--url …]`, `--deep`. |
 | `local-brain commit` | Conventional Commits message for staged changes. `--commit` to commit (opens your editor), `--install-hook` for a `prepare-commit-msg` hook. |
 | `local-brain pr [--base main]` | Pull request title and description from the branch diff and the decision log. |

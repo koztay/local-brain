@@ -24,6 +24,7 @@ mod registry;
 mod runtime;
 mod scan;
 mod secrets;
+mod settings;
 mod setup;
 mod slice;
 mod store;
@@ -213,6 +214,20 @@ enum Cmd {
         #[command(subcommand)]
         cmd: MemoryCmd,
     },
+    /// Show, explain and change settings (~/.local-brain/config.toml)
+    Config {
+        #[command(subcommand)]
+        cmd: Option<ConfigCmd>,
+    },
+    /// Tune memory and background settings to this machine's RAM (shows the changes first)
+    Optimize {
+        /// Only show what would change
+        #[arg(long)]
+        dry_run: bool,
+        /// Apply without asking
+        #[arg(long, short)]
+        yes: bool,
+    },
     /// Run, start, stop or install the background daemon
     Daemon {
         #[command(subcommand)]
@@ -266,6 +281,22 @@ enum MemoryCmd {
         #[arg(long)]
         project: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Every setting with its value, default, meaning and tuning notes (the default)
+    List {
+        /// Only settings that differ from the defaults
+        #[arg(long)]
+        changed: bool,
+    },
+    /// Show one setting, e.g. `daemon.min_free_memory_pct`
+    Get { key: String },
+    /// Change a setting, e.g. `local-brain config set daemon.bg_pace_secs 30`
+    Set { key: String, value: String },
+    /// Put a setting back to its default
+    Reset { key: String },
 }
 
 #[derive(Subcommand)]
@@ -329,6 +360,8 @@ fn main() {
             | Cmd::Bench { .. }
             | Cmd::Doctor { .. }
             | Cmd::Memory { .. }
+            | Cmd::Config { .. }
+            | Cmd::Optimize { .. }
     );
     if interactive {
         update::repair();
@@ -639,6 +672,13 @@ fn real_main(cli: Cli) -> Result<i32> {
                 }
             }
         },
+        Cmd::Config { cmd } => match cmd.unwrap_or(ConfigCmd::List { changed: false }) {
+            ConfigCmd::List { changed } => settings::list(changed)?,
+            ConfigCmd::Get { key } => settings::get(&key)?,
+            ConfigCmd::Set { key, value } => settings::set(&key, &value)?,
+            ConfigCmd::Reset { key } => settings::reset(&key)?,
+        },
+        Cmd::Optimize { dry_run, yes } => settings::optimize(dry_run, yes)?,
         Cmd::Daemon { cmd } => match cmd {
             DaemonCmd::Run => daemon::run()?,
             DaemonCmd::Start => println!("daemon running (pid {})", daemon::start()?),

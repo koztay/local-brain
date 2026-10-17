@@ -4,6 +4,18 @@ local-brain reads `~/.local-brain/config.toml` (global, created by `local-brain 
 `<project>/.local-brain/config.toml` (per project). Set `LOCAL_BRAIN_HOME` to use another global
 directory. Unknown keys are ignored; missing keys take the defaults shown here.
 
+The defaults are tuned for a 16 GB machine. `local-brain config` lists every setting with its
+meaning and tuning notes, `local-brain config set <section.key> <value>` changes one, and
+`local-brain optimize` adjusts the memory-related ones below (`keep_alive`, `[daemon]`,
+`embed_batch`, `max_llm_files`) to this machine's RAM:
+
+| RAM | `keep_alive` | `idle_unload_minutes` | `min_free_memory_pct` | `bg_backoff_secs` | `bg_pace_secs` | `bg_pass_secs` | `embed_batch` | `max_llm_files` |
+|---|---|---|---|---|---|---|---|---|
+| < 12 GB | `5m` | 5 | 25 | 300 | 180 | 20 | 16 | 150 |
+| 12-23 GB | `10m` | 10 | 15 | 180 | 90 | 30 | 32 | 300 |
+| 24-47 GB | `20m` | 20 | 10 | 120 | 30 | 60 | 64 | 500 |
+| 48 GB+ | `30m` | 30 | 8 | 60 | 0 | 120 | 128 | 800 |
+
 ## `[runtime]`
 
 | Key | Default | Meaning |
@@ -91,6 +103,11 @@ files (`.env*`, `*.pem`, `*.key`, `id_rsa*`, credential/secret JSON/YAML, `*.tfs
 |---|---|---|
 | `debounce_ms` | `500` | Quiet time before a batch of file changes is processed |
 | `idle_unload_minutes` | `10` | Release model memory after this much inactivity |
+| `min_free_memory_pct` | `15` | Background summaries wait, and the model is unloaded, while free RAM is below this percentage; on macOS also while the kernel reports memory pressure (keeps the OS from swapping to disk). 0 disables |
+| `bg_quiet_secs` | `45` | Background model work starts only after this long without file changes |
+| `bg_pass_secs` | `30` | Model time per background pass; file watching resumes between passes |
+| `bg_backoff_secs` | `180` | Wait after finding memory below the floor (model unloaded meanwhile) |
+| `bg_pace_secs` | `90` | Minimum gap between passes while free memory is under twice the floor (model unloaded in the gaps) |
 
 ## `[network]`
 

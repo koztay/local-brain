@@ -2,7 +2,7 @@
 //! updates the AST graph immediately and catches up embeddings/summaries in the background.
 //! It talks to nobody over the network; the CLI, hooks and MCP server share the SQLite stores.
 
-use crate::config::Config;
+use crate::config::{Config, DaemonCfg};
 use crate::paths::{self, Project};
 use crate::registry;
 use crate::store::Store;
@@ -125,6 +125,14 @@ struct ProjState {
     last_event: Instant,
     dirty_since: Option<Instant>,
     full_reindex: bool,
+    /// Summaries the last background pass left for later.
+    bg_pending: usize,
+    /// The next background pass may not start before this (memory-pressure back-off).
+    bg_not_before: Instant,
+    /// When the last background pass finished.
+    bg_last_pass: Option<Instant>,
+    /// Background work is currently held back by memory pressure (logged once per episode).
+    bg_waiting: bool,
 }
 
 impl ProjState {
@@ -135,6 +143,10 @@ impl ProjState {
             // Catch up once after start: model summaries `learn` left for the background.
             dirty_since: Some(Instant::now()),
             full_reindex: false,
+            bg_pending: 0,
+            bg_not_before: Instant::now(),
+            bg_last_pass: None,
+            bg_waiting: false,
         }
     }
 }
@@ -298,10 +310,46 @@ pub fn run() -> Result<()> {
                 }
             }
             // Background catch-up (model embeddings, stale summaries) once things are quiet.
+            let quiet = Duration::from_secs(global.daemon.bg_quiet_secs);
             if let Some(since) = st.dirty_since {
-                if since.elapsed() >= Duration::from_secs(45)
-                    && st.last_event.elapsed() >= Duration::from_secs(30)
+                if since.elapsed() >= quiet
+                    && st.last_event.elapsed() >= quiet
+                    && Instant::now() >= st.bg_not_before
                 {
+                    let mem = memory();
+                    if let BgPlan::Wait(d) = next_background_pass(
+                        &global.daemon,
+                        mem.as_ref().map(Mem::effective_pct),
+                        st.bg_pending,
+                        st.bg_last_pass.map(|t| t.elapsed()),
+                    ) {
+                        // Release the model while waiting: a hot model under memory pressure is
+                        // what pushes the OS into swapping to the system disk.
+                        if !unloaded {
+                            unload_models(&global);
+                            unloaded = true;
+                        }
+                        if !st.bg_waiting {
+                            eprintln!(
+                                "[{}] {}: low memory ({}, floor {}%), background summaries wait; model unloaded",
+                                util::fmt_ts(util::now()),
+                                root.display(),
+                                Mem::describe(mem.as_ref()),
+                                global.daemon.min_free_memory_pct
+                            );
+                            st.bg_waiting = true;
+                        }
+                        st.bg_not_before = Instant::now() + d;
+                        continue;
+                    }
+                    if st.bg_waiting {
+                        eprintln!(
+                            "[{}] {}: memory available again, background summaries resume",
+                            util::fmt_ts(util::now()),
+                            root.display()
+                        );
+                        st.bg_waiting = false;
+                    }
                     st.dirty_since = None;
                     let cfg = Config::load(Some(&project));
                     match crate::learn::learn(
@@ -310,7 +358,9 @@ pub fn run() -> Result<()> {
                         crate::learn::Options {
                             quiet: true,
                             // Short passes keep file watching responsive between them.
-                            summary_budget: Some(Duration::from_secs(30)),
+                            summary_budget: Some(Duration::from_secs(
+                                global.daemon.bg_pass_secs.max(1),
+                            )),
                             ..Default::default()
                         },
                     ) {
@@ -326,10 +376,10 @@ pub fn run() -> Result<()> {
                                     r.summaries_pending
                                 );
                             }
+                            st.bg_pending = r.summaries_pending;
                             if r.summaries_pending > 0 {
                                 // More to do: run the next pass as soon as things are quiet.
-                                st.dirty_since =
-                                    Instant::now().checked_sub(Duration::from_secs(45));
+                                st.dirty_since = Instant::now().checked_sub(quiet);
                             }
                         }
                         Err(e) => eprintln!(
@@ -340,6 +390,23 @@ pub fn run() -> Result<()> {
                         ),
                     }
                     last_activity = Instant::now();
+                    st.bg_last_pass = Some(Instant::now());
+                    unloaded = false;
+                    // The pass itself can push the machine under pressure (the model is several
+                    // GB); then do not let keep_alive hold it for minutes after the work is done.
+                    let floor = global.daemon.min_free_memory_pct;
+                    let mem = memory();
+                    if mem.as_ref().is_some_and(|m| m.effective_pct() < floor) {
+                        unload_models(&global);
+                        unloaded = true;
+                        eprintln!(
+                            "[{}] {}: low memory after the pass ({}, floor {}%); model unloaded",
+                            util::fmt_ts(util::now()),
+                            root.display(),
+                            Mem::describe(mem.as_ref()),
+                            floor
+                        );
+                    }
                 }
             }
         }
@@ -349,20 +416,131 @@ pub fn run() -> Result<()> {
             && last_activity.elapsed()
                 >= Duration::from_secs(global.daemon.idle_unload_minutes * 60)
         {
-            let rt = crate::runtime::Runtime::from_config(&global);
-            for m in [
-                &global.models.general,
-                &global.models.code,
-                &global.models.vision,
-                &global.models.embedding,
-            ] {
-                if !m.is_empty() {
-                    let _ = rt.unload(m);
-                }
-            }
+            unload_models(&global);
             unloaded = true;
         }
     }
+}
+
+fn unload_models(global: &Config) {
+    let rt = crate::runtime::Runtime::from_config(global);
+    for m in [
+        &global.models.general,
+        &global.models.code,
+        &global.models.vision,
+        &global.models.embedding,
+    ] {
+        if !m.is_empty() {
+            let _ = rt.unload(m);
+        }
+    }
+}
+
+/// A reading of system memory.
+struct Mem {
+    /// Free memory in percent of RAM.
+    free_pct: u64,
+    /// The OS reports memory pressure (macOS: warn or critical) — it is already compressing
+    /// and swapping, whatever `free_pct` says.
+    pressure: bool,
+}
+
+impl Mem {
+    /// The value the back-off policy compares with the floor: 0 under pressure.
+    fn effective_pct(&self) -> u64 {
+        if self.pressure {
+            0
+        } else {
+            self.free_pct
+        }
+    }
+
+    fn describe(m: Option<&Mem>) -> String {
+        match m {
+            None => "free memory unknown".into(),
+            Some(m) if m.pressure => format!("{}% free, OS reports memory pressure", m.free_pct),
+            Some(m) => format!("{}% free", m.free_pct),
+        }
+    }
+}
+
+/// Read system memory, or None when it cannot be read.
+#[cfg(target_os = "macos")]
+fn memory() -> Option<Mem> {
+    // sysinfo's available memory reads ~0 on macOS (it counts only truly free pages, and the
+    // kernel keeps those near zero). Ask the kernel instead: `kern.memorystatus_level` is the
+    // free percentage `memory_pressure` prints; pressure level 2 is warn, 4 critical.
+    fn sysctl_u32(name: &std::ffi::CStr) -> Option<u32> {
+        let mut v: u32 = 0;
+        let mut len = std::mem::size_of::<u32>();
+        // SAFETY: `v` and `len` describe a valid u32 buffer; no new value is written.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                &mut v as *mut u32 as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0).then_some(v)
+    }
+    Some(Mem {
+        free_pct: u64::from(sysctl_u32(c"kern.memorystatus_level")?),
+        pressure: sysctl_u32(c"kern.memorystatus_vm_pressure_level").is_some_and(|l| l >= 2),
+    })
+}
+
+/// Read system memory, or None when it cannot be read.
+#[cfg(not(target_os = "macos"))]
+fn memory() -> Option<Mem> {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let total = sys.total_memory();
+    (total > 0).then(|| Mem {
+        free_pct: sys.available_memory() * 100 / total,
+        pressure: false,
+    })
+}
+
+/// What the daemon does with a due background pass (model summaries/embeddings).
+#[derive(Debug, PartialEq)]
+enum BgPlan {
+    /// Run the pass now; the model stays loaded.
+    Run,
+    /// Skip it: unload the model and ask again after this long.
+    Wait(Duration),
+}
+
+/// Decide whether a due background pass runs now.
+///
+/// `free_pct` is free RAM in percent (None if unknown), `pending` the summaries the previous
+/// pass left over (0 before the first pass), `since_last` the time since the previous pass
+/// finished. `Wait` unloads the model (several GB) for its duration, so RAM is really returned
+/// to the system. All thresholds come from `[daemon]` (`local-brain config list`):
+///
+/// * Below `min_free_memory_pct`: wait `bg_backoff_secs`.
+/// * Under twice that with a queue: at least `bg_pace_secs` between passes.
+/// * Otherwise (or when memory cannot be read): run; `keep_alive` and the idle unload apply.
+fn next_background_pass(
+    d: &DaemonCfg,
+    free_pct: Option<u64>,
+    pending: usize,
+    since_last: Option<Duration>,
+) -> BgPlan {
+    let Some(free) = free_pct else {
+        return BgPlan::Run;
+    };
+    if free < d.min_free_memory_pct {
+        return BgPlan::Wait(Duration::from_secs(d.bg_backoff_secs));
+    }
+    let gap = Duration::from_secs(d.bg_pace_secs);
+    if free < d.min_free_memory_pct.saturating_mul(2) && pending > 0 {
+        if let Some(since) = since_last.filter(|s| *s < gap) {
+            return BgPlan::Wait(gap - since);
+        }
+    }
+    BgPlan::Run
 }
 
 // ---- OS service installation -----------------------------------------------------------------
@@ -518,5 +696,78 @@ pub fn uninstall_service() -> Result<String> {
         Ok("removed scheduled task".into())
     } else {
         Ok("nothing to remove".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const S: fn(u64) -> Duration = Duration::from_secs;
+
+    fn plan(free: Option<u64>, pending: usize, since: Option<u64>) -> BgPlan {
+        next_background_pass(&DaemonCfg::default(), free, pending, since.map(S))
+    }
+
+    #[test]
+    fn waits_below_the_memory_floor() {
+        assert_eq!(plan(Some(10), 50, None), BgPlan::Wait(S(180)));
+        assert_eq!(plan(Some(14), 0, Some(600)), BgPlan::Wait(S(180)));
+    }
+
+    #[test]
+    fn paces_a_queue_when_memory_is_tight() {
+        assert_eq!(plan(Some(20), 30, Some(10)), BgPlan::Wait(S(80)));
+        assert_eq!(plan(Some(20), 30, Some(90)), BgPlan::Run);
+        assert_eq!(plan(Some(20), 30, None), BgPlan::Run);
+        // A one-off pass (nothing queued) is not delayed.
+        assert_eq!(plan(Some(20), 0, Some(10)), BgPlan::Run);
+    }
+
+    #[test]
+    fn runs_with_plenty_of_memory_or_when_unknown() {
+        assert_eq!(plan(Some(60), 300, Some(1)), BgPlan::Run);
+        assert_eq!(plan(None, 300, Some(1)), BgPlan::Run);
+    }
+
+    #[test]
+    fn pressure_counts_as_no_free_memory_but_is_reported_honestly() {
+        let m = Mem {
+            free_pct: 42,
+            pressure: true,
+        };
+        assert_eq!(m.effective_pct(), 0);
+        assert_eq!(
+            Mem::describe(Some(&m)),
+            "42% free, OS reports memory pressure"
+        );
+        assert_eq!(Mem::describe(None), "free memory unknown");
+    }
+
+    #[test]
+    fn follows_the_configured_thresholds() {
+        let d = DaemonCfg {
+            min_free_memory_pct: 0,
+            ..DaemonCfg::default()
+        };
+        // A floor of 0 disables the back-off.
+        assert_eq!(
+            next_background_pass(&d, Some(0), 300, Some(S(1))),
+            BgPlan::Run
+        );
+        let d = DaemonCfg {
+            min_free_memory_pct: 30,
+            bg_backoff_secs: 60,
+            bg_pace_secs: 20,
+            ..DaemonCfg::default()
+        };
+        assert_eq!(
+            next_background_pass(&d, Some(25), 1, None),
+            BgPlan::Wait(S(60))
+        );
+        assert_eq!(
+            next_background_pass(&d, Some(45), 1, Some(S(5))),
+            BgPlan::Wait(S(15))
+        );
     }
 }

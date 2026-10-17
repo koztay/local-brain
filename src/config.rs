@@ -108,6 +108,17 @@ pub struct IndexCfg {
 pub struct DaemonCfg {
     pub debounce_ms: u64,
     pub idle_unload_minutes: u64,
+    /// Background model work waits (and the model is unloaded) while free system memory,
+    /// in percent of RAM, is below this. 0 disables the check.
+    pub min_free_memory_pct: u64,
+    /// Background model work starts only after this long without file changes.
+    pub bg_quiet_secs: u64,
+    /// Model time per background pass; file watching resumes between passes.
+    pub bg_pass_secs: u64,
+    /// Wait after finding memory below `min_free_memory_pct` (model unloaded meanwhile).
+    pub bg_backoff_secs: u64,
+    /// Minimum gap between passes while free memory is under twice `min_free_memory_pct`.
+    pub bg_pace_secs: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -203,6 +214,11 @@ impl Default for DaemonCfg {
         DaemonCfg {
             debounce_ms: 500,
             idle_unload_minutes: 10,
+            min_free_memory_pct: 15,
+            bg_quiet_secs: 45,
+            bg_pass_secs: 30,
+            bg_backoff_secs: 180,
+            bg_pace_secs: 90,
         }
     }
 }
