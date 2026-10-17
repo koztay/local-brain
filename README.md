@@ -136,11 +136,18 @@ again.
 
 local-brain works without any model (graph, search, compression and memory are deterministic).
 A local runtime adds summaries, local image reading, smarter compression and generated
-commit/PR texts. Any of these works; the first one found is used:
+commit/PR texts.
+
+**You do not need to set one up yourself.** When `local-brain init` finds no runtime it offers to
+install [Ollama](https://ollama.com) (Homebrew or the signed app on macOS, the official installer
+on Linux, winget on Windows), starts it and downloads the models for your hardware tier — one
+question, one "yes". Use `--yes` to accept without asking, or `--no-models` to stay model-free.
+
+If you already run another runtime, local-brain uses it instead; the first one found wins:
 
 | Runtime | Setup |
 |---|---|
-| [Ollama](https://ollama.com) (easiest) | Install and start it. `local-brain init` offers to download the right models. |
+| [Ollama](https://ollama.com) (easiest) | Nothing to do — `local-brain init` installs, starts and configures it. |
 | [LM Studio](https://lmstudio.ai) | Start the local server (port 1234) and load the models named in `~/.local-brain/config.toml`. |
 | MLX (Apple Silicon) | `pip install mlx-lm` then `mlx_lm.server --port 8080` (`mlx_vlm.server` for vision). |
 | llama.cpp | `llama-server -m model.gguf --port 8080` (add `--embeddings` for an embedding server). |

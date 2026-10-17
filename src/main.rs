@@ -24,6 +24,7 @@ mod registry;
 mod runtime;
 mod scan;
 mod secrets;
+mod setup;
 mod slice;
 mod store;
 mod summarize;

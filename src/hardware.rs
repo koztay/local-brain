@@ -27,7 +27,7 @@ pub struct DetectedRuntime {
     pub detail: String,
 }
 
-fn on_path(bin: &str) -> bool {
+pub fn on_path(bin: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };

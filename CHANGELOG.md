@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- `init` installs, starts and configures Ollama when no local model runtime is found (Homebrew or
+  the signed app on macOS, the official installer on Linux, winget on Windows), then downloads the
+  tier's models — after a single confirmation, or automatically with `--yes`. An installed but
+  stopped Ollama is started automatically.
+
 ## [0.1.0] - 2026-10-17
 
 ### Added

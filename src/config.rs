@@ -29,6 +29,9 @@ pub struct RuntimeCfg {
     pub keep_alive: String,
     pub timeout_secs: u64,
     pub api_key: String,
+    /// Where Ollama keeps its models when local-brain installed it on another drive.
+    /// Empty = Ollama's default location.
+    pub ollama_models_dir: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -124,6 +127,7 @@ impl Default for RuntimeCfg {
             keep_alive: "10m".into(),
             timeout_secs: 180,
             api_key: String::new(),
+            ollama_models_dir: String::new(),
         }
     }
 }

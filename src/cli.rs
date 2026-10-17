@@ -103,6 +103,8 @@ pub fn configure_global(
             cfg.models.tier
         ));
     }
+    // One "yes" to installing the runtime also covers downloading the models.
+    let yes = crate::setup::ensure_runtime(&mut cfg, yes, no_models)? || yes;
     ensure_models(&cfg, yes, no_models);
     Ok(cfg)
 }
@@ -164,8 +166,7 @@ fn adopt_server_models(cfg: &mut Config) {
 fn ensure_models(cfg: &Config, yes: bool, no_models: bool) {
     let rt = Runtime::from_config(cfg);
     if !rt.enabled() {
-        warn("No local model runtime found. local-brain runs in deterministic mode (code graph, hash embeddings, rule-based compression).");
-        warn("For summaries, image reading and LLM compression install Ollama (https://ollama.com) or LM Studio, then run `local-brain init --reconfigure`.");
+        warn("No local model: local-brain runs in deterministic mode (code graph, hash embeddings, rule-based compression).");
         return;
     }
     if !rt.is_up() {
@@ -882,6 +883,10 @@ pub fn uninstall(path: Option<&Path>, project_only: bool, yes: bool) -> Result<(
     }
     let _ = daemon::uninstall_service();
     let _ = daemon::stop();
+    if let Some(m) = crate::setup::remove_service(&Config::load_global().runtime.ollama_models_dir)
+    {
+        ok(&m);
+    }
     if paths::home().exists() {
         std::fs::remove_dir_all(paths::home())?;
     }

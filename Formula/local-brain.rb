@@ -42,9 +42,9 @@ class LocalBrain < Formula
 
   def caveats
     <<~EOS
-      Optional: install a local model runtime such as Ollama (brew install ollama) for
-      summaries, local image reading and smarter compression.
-      Then in a project: local-brain init && local-brain learn
+      In a project: local-brain init && local-brain learn
+      init offers to install and configure a local model (Ollama) for summaries,
+      local image reading and smarter compression.
     EOS
   end
 

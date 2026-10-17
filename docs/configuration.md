@@ -92,7 +92,7 @@ files (`.env*`, `*.pem`, `*.key`, `id_rsa*`, credential/secret JSON/YAML, `*.tfs
 
 | Key | Default | Meaning |
 |---|---|---|
-| `allow_downloads` | `true` | Allow `init` to download models through Ollama. Nothing else uses the internet |
+| `allow_downloads` | `true` | Allow `init` to install Ollama and download models through it. Nothing else uses the internet |
 
 ## Project files
 
