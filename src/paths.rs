@@ -178,6 +178,21 @@ pub fn exe() -> String {
     std::env::current_exe()
         .ok()
         .and_then(|p| std::fs::canonicalize(p).ok())
-        .map(|p| p.to_string_lossy().to_string())
+        .map(|p| stable_exe(&p).to_string_lossy().to_string())
         .unwrap_or_else(|| "local-brain".into())
+}
+
+/// Homebrew keeps each version in its own Cellar folder and deletes the old one on upgrade, so
+/// hooks, MCP registrations and services must point at the `<prefix>/bin` symlink instead.
+pub fn stable_exe(real: &Path) -> PathBuf {
+    let s = real.to_string_lossy();
+    if let Some(i) = s.find("/Cellar/local-brain/") {
+        if let Some(name) = real.file_name() {
+            let link = PathBuf::from(&s[..i]).join("bin").join(name);
+            if link.exists() {
+                return link;
+            }
+        }
+    }
+    real.to_path_buf()
 }

@@ -108,8 +108,10 @@ pub struct DaemonCfg {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct NetworkCfg {
-    /// Allow model downloads (the only internet access local-brain ever makes).
+    /// Allow `init` to install Ollama and download models.
     pub allow_downloads: bool,
+    /// Ask GitHub once a day whether a newer local-brain release exists (no data is sent).
+    pub check_updates: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -201,6 +203,7 @@ impl Default for NetworkCfg {
     fn default() -> Self {
         NetworkCfg {
             allow_downloads: true,
+            check_updates: true,
         }
     }
 }

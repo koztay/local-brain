@@ -249,6 +249,15 @@ pub fn init(opts: InitOptions) -> Result<()> {
     let root = paths::git_root(&start).unwrap_or(start);
     let root = std::fs::canonicalize(&root)?;
     eprintln!("local-brain init — {}", root.display());
+    if crate::update::offer_in_init(opts.yes) {
+        // Continue with the new binary, same arguments; it must not offer the update again.
+        eprintln!("Continuing with the new version…\n");
+        let status = std::process::Command::new(paths::exe())
+            .args(std::env::args_os().skip(1))
+            .env("LOCAL_BRAIN_NO_UPDATE_CHECK", "1")
+            .status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
     let _cfg = configure_global(
         opts.reconfigure,
         opts.provider.as_deref(),

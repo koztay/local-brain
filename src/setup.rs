@@ -476,16 +476,12 @@ fn install_macos_app() -> Result<()> {
 }
 
 /// A fresh directory only this user can read, so nothing else can swap the download.
-fn private_temp_dir() -> Result<PathBuf> {
+pub(crate) fn private_temp_dir() -> Result<PathBuf> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let d = std::env::temp_dir().join(format!(
-        "local-brain-ollama-{}-{}",
-        std::process::id(),
-        nanos
-    ));
+    let d = std::env::temp_dir().join(format!("local-brain-{}-{}", std::process::id(), nanos));
     // create_dir (not create_dir_all) fails if the path already exists.
     std::fs::create_dir(&d).with_context(|| format!("creating {}", d.display()))?;
     #[cfg(unix)]
@@ -516,7 +512,7 @@ fn is_writable(dir: &str) -> bool {
     okay
 }
 
-fn download(url: &str, to: &Path, label: &str) -> Result<()> {
+pub(crate) fn download(url: &str, to: &Path, label: &str) -> Result<()> {
     use std::io::{Read, Write};
     let resp = ureq::get(url)
         .call()
@@ -533,6 +529,11 @@ fn download(url: &str, to: &Path, label: &str) -> Result<()> {
         .with_context(|| format!("creating {}", to.display()))?;
     let mut buf = vec![0u8; 1 << 16];
     let mut done = 0f64;
+    let mut shown = -1i64;
+    let tty = {
+        use std::io::IsTerminal;
+        std::io::stderr().is_terminal()
+    };
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
@@ -540,16 +541,20 @@ fn download(url: &str, to: &Path, label: &str) -> Result<()> {
         }
         file.write_all(&buf[..n])?;
         done += n as f64;
-        if total > 0.0 {
-            eprint!(
-                "\r  {}: downloading {:5.1}%   ",
-                label,
-                done / total * 100.0
-            );
+        let pct = if total > 0.0 {
+            (done / total * 100.0) as i64
+        } else {
+            -1
+        };
+        if tty && pct >= 0 && pct != shown {
+            shown = pct;
+            eprint!("\r  {}: downloading {:3}%   ", label, pct);
             let _ = std::io::stderr().flush();
         }
     }
-    eprintln!();
+    if shown >= 0 {
+        eprintln!();
+    }
     Ok(())
 }
 

@@ -219,7 +219,13 @@ A checklist to verify everything end to end (≈10 minutes):
 | `local-brain memory show\|note\|done\|path` | Project memory: decisions (what + why), open tasks, notes, session summaries. |
 | `local-brain daemon run\|start\|stop\|status\|install\|uninstall` | The global daemon; `install` registers a launchd agent (macOS), systemd user service (Linux) or a logon task (Windows). |
 | `local-brain uninstall [--project]` | Remove the integration and index from one project, or from all projects plus global data. |
+| `local-brain update [--force]` | Update to the latest release the way you installed it: `brew upgrade`, `cargo install`, or an in-place swap of the checksum-verified archive. Restarts the daemon. |
 | `local-brain mcp` | The MCP server (Claude Code starts it; you normally don't). |
+
+**Updates.** Once a day local-brain asks GitHub, in the background, whether a newer release
+exists. Commands you run in a terminal then show a one-line notice, and `init` offers to update
+before it continues. Hooks, the MCP server and the daemon never print it. Turn it off with
+`[network] check_updates = false` or `LOCAL_BRAIN_NO_UPDATE_CHECK=1`.
 
 ## Claude Code integration
 
@@ -306,9 +312,12 @@ See [docs/configuration.md](docs/configuration.md) for every option.
 
 ## Privacy and security
 
-* **Nothing leaves your machine.** The only network access is model downloads through your
-  runtime (disable with `[network] allow_downloads = false`). Requests to the model runtime go to
-  `localhost` and bypass HTTP proxies.
+* **Nothing leaves your machine.** Your code, prompts and outputs are never sent anywhere. The
+  only network access is installing Ollama and downloading models during `init` (disable with
+  `[network] allow_downloads = false`) and a daily request to the GitHub releases API to see if
+  an update exists, which sends nothing but the version in the User-Agent (disable with
+  `[network] check_updates = false`). Requests to the model runtime go to `localhost` and bypass
+  HTTP proxies.
 * **No ports are opened.** The MCP server talks over stdio; the daemon has no network listener.
 * **Secret files are never indexed or read** (`.env*`, keys, certificates, credential files,
   Terraform state, …), in addition to everything in `.gitignore`.
@@ -373,8 +382,9 @@ and deletes `~/.local-brain`. Then remove the binary: `brew uninstall local-brai
    manually from the Actions tab with the new tag name.
 3. The workflow builds all five platforms, signs and notarizes the macOS binaries (when the Apple
    secrets are configured, see [docs/macos-signing.md](docs/macos-signing.md)), and publishes the
-   release with `SHA256SUMS` and notes from the changelog. Then update the URLs and checksums in
-   `Formula/local-brain.rb`.
+   release with `SHA256SUMS` and notes from the changelog. A final job points
+   `Formula/local-brain.rb` at the new release and commits it to `main`, so `brew upgrade` and
+   `local-brain update` see the new version right away.
 
 ## Contributing
 

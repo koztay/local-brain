@@ -93,7 +93,8 @@ files (`.env*`, `*.pem`, `*.key`, `id_rsa*`, credential/secret JSON/YAML, `*.tfs
 
 | Key | Default | Meaning |
 |---|---|---|
-| `allow_downloads` | `true` | Allow `init` to install Ollama and download models through it. Nothing else uses the internet |
+| `allow_downloads` | `true` | Allow `init` to install Ollama and download models through it |
+| `check_updates` | `true` | Ask the GitHub releases API once a day whether a newer local-brain exists (also `LOCAL_BRAIN_NO_UPDATE_CHECK=1`) |
 
 ## Project files
 

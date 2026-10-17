@@ -4,13 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.1.1] - 2026-10-17
 
 ### Added
+- Update notifications: a daily background check of the latest GitHub release; interactive
+  commands print a one-line notice and `init` offers to update, then continues with the new
+  version. Off with `[network] check_updates = false` or `LOCAL_BRAIN_NO_UPDATE_CHECK=1`.
+- `local-brain update [--force]`: upgrades via Homebrew, cargo, or by swapping in the
+  checksum-verified (and, on macOS, signature-checked) release binary; restarts the daemon.
+- Models can be stored on an external drive: `init` asks where when one is connected
+  (`runtime.ollama_models_dir`).
 - `init` installs, starts and configures Ollama when no local model runtime is found (Homebrew or
   the signed app on macOS, the official installer on Linux, winget on Windows), then downloads the
   tier's models — after a single confirmation, or automatically with `--yes`. An installed but
   stopped Ollama is started automatically.
+
+### Fixed
+- Homebrew installs register the stable `<prefix>/bin/local-brain` path for hooks, MCP and the
+  daemon instead of the versioned Cellar path that `brew upgrade` deletes. Run `local-brain init`
+  once in projects set up with 0.1.0.
+
+### Changed
+- The release workflow updates the Homebrew formula automatically.
 
 ## [0.1.0] - 2026-10-17
 

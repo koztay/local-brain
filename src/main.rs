@@ -28,6 +28,7 @@ mod setup;
 mod slice;
 mod store;
 mod summarize;
+mod update;
 mod util;
 
 use anyhow::{bail, Result};
@@ -225,6 +226,15 @@ enum Cmd {
     /// Handle a Claude Code hook event (reads JSON on stdin)
     #[command(hide = true)]
     Hook { event: String },
+    /// Update local-brain to the latest release (Homebrew, cargo or the installed binary)
+    Update {
+        /// Reinstall the latest release even if this version is current
+        #[arg(long)]
+        force: bool,
+    },
+    /// Refresh the cached latest-release check (run in the background)
+    #[command(name = "__update-check", hide = true)]
+    UpdateCheck,
 }
 
 #[derive(Subcommand)]
@@ -305,8 +315,25 @@ fn main() {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let cli = Cli::parse();
+    // Commands a person runs by hand; hooks, MCP, the daemon and wrapped output stay silent.
+    let interactive = matches!(
+        cli.cmd,
+        Cmd::Init { .. }
+            | Cmd::Learn { .. }
+            | Cmd::Watch { .. }
+            | Cmd::Status { .. }
+            | Cmd::Ask { .. }
+            | Cmd::Bench { .. }
+            | Cmd::Doctor { .. }
+            | Cmd::Memory { .. }
+    );
     match real_main(cli) {
-        Ok(code) => std::process::exit(code),
+        Ok(code) => {
+            if interactive {
+                update::notify();
+            }
+            std::process::exit(code)
+        }
         Err(e) => {
             eprintln!("error: {:#}", e);
             std::process::exit(1);
@@ -631,6 +658,8 @@ fn real_main(cli: Cli) -> Result<i32> {
         },
         Cmd::Mcp { project } => mcp::serve(project.as_deref())?,
         Cmd::Hook { event } => hooks::run(&event)?,
+        Cmd::Update { force } => update::update(force)?,
+        Cmd::UpdateCheck => update::refresh(),
     }
     Ok(0)
 }

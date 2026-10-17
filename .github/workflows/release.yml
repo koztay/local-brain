@@ -184,3 +184,28 @@ jobs:
           files: |
             dist/local-brain-*
             dist/SHA256SUMS
+
+  homebrew:
+    # Keep the tap formula in this repo pointing at the newest release, so `brew upgrade`
+    # (and `local-brain update`) pick it up without a manual checksum edit.
+    needs: release
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.inputs.tag || github.ref_name, '-') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Update Formula/local-brain.rb
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$TAG" -p SHA256SUMS -O "$RUNNER_TEMP/SHA256SUMS"
+          python3 scripts/update-formula.py "$TAG" "$RUNNER_TEMP/SHA256SUMS"
+          if git diff --quiet; then
+            echo "formula already up to date"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: update Homebrew formula for $TAG"
+          git push origin HEAD:main
