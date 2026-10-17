@@ -81,25 +81,57 @@ Claude Code, Claude Code + graphify, and Claude Code + local-brain.
 
 ### 1. Install
 
-From source (needs [Rust](https://rustup.rs) 1.80+ and a C compiler, e.g. Xcode Command Line Tools
-on macOS or `build-essential` on Linux):
+local-brain is a single, self-contained binary (no Rust, Python or Node needed).
 
-```sh
-cargo install --git https://github.com/koztay/local-brain --locked
-```
-
-or with the install script (downloads a release binary when available, otherwise builds from source):
+**macOS and Linux:**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/koztay/local-brain/main/install.sh | sh
 ```
 
-or with Homebrew (builds from the latest source):
+The script downloads the binary for your platform from the
+[latest release](https://github.com/koztay/local-brain/releases/latest), verifies its SHA-256
+checksum and installs it to `~/.local/bin` (set `LOCAL_BRAIN_INSTALL_DIR` to change it, or
+`LOCAL_BRAIN_VERSION=v0.1.0` to pin a version).
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/koztay/local-brain/main/install.ps1 | iex
+```
+
+Installs to `%LOCALAPPDATA%\local-brain\bin` and adds it to your user `PATH`.
+
+**Homebrew (macOS, Linux):**
 
 ```sh
 brew tap koztay/local-brain https://github.com/koztay/local-brain
-brew install --HEAD local-brain
+brew install local-brain
 ```
+
+**Manual download:** grab the archive for your platform from the
+[releases page](https://github.com/koztay/local-brain/releases/latest), check it against
+`SHA256SUMS`, unpack it and put `local-brain` on your `PATH`.
+
+| Platform | Archive |
+|---|---|
+| macOS, Apple Silicon | `local-brain-aarch64-apple-darwin.tar.gz` |
+| macOS, Intel | `local-brain-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 | `local-brain-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux ARM64 | `local-brain-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows x86_64 | `local-brain-x86_64-pc-windows-msvc.zip` |
+
+> On macOS the binaries are not notarized yet. The install script clears the quarantine flag for
+> you; after a manual download run `xattr -d com.apple.quarantine local-brain` once.
+
+**From source** (needs [Rust](https://rustup.rs) 1.80+ and a C compiler):
+
+```sh
+cargo install --git https://github.com/koztay/local-brain --locked
+```
+
+Check the installation with `local-brain --version`. To upgrade, run the same install command
+again.
 
 ### 2. (Optional, recommended) a local model runtime
 
@@ -305,9 +337,9 @@ Differences from the original design, and what's next:
 * **Storage:** vectors are stored in SQLite and searched exhaustively — fast for typical
   repositories (up to ~100k chunks). An ANN index is planned for very large monorepos.
 * **Agents:** Claude Code today; the agent adapter layer is in place for Codex (phase 2).
-* **Distribution:** source install, install script and a HEAD Homebrew formula today; signed
-  release binaries for macOS (arm64/x64), Linux (x64/arm64) and Windows (x64) are produced by the
-  release workflow when a version is tagged.
+* **Distribution:** prebuilt binaries for macOS (arm64/x64), Linux (x64/arm64) and Windows (x64)
+  with SHA-256 checksums, install scripts and a Homebrew formula. Code signing / notarization and
+  inclusion in homebrew-core are planned.
 
 ## Troubleshooting
 
@@ -319,6 +351,20 @@ Differences from the original design, and what's next:
   run `local-brain learn` again (only missing/changed work is redone).
 * Want the old behavior for a moment? Repeat the same Read/Grep/Glob call, or set the relevant
   `[hooks]` option to `false`.
+
+## Uninstall
+
+`local-brain uninstall` removes the integration and index from every project, stops the daemon
+and deletes `~/.local-brain`. Then remove the binary: `brew uninstall local-brain`, or delete
+`~/.local/bin/local-brain` (Windows: `%LOCALAPPDATA%\local-brain\bin\local-brain.exe`).
+
+## Releasing (maintainers)
+
+1. Update the version in `Cargo.toml` and add a section to `CHANGELOG.md`.
+2. Push a tag (`git tag v0.2.0 && git push origin v0.2.0`) — or run the **Release** workflow
+   manually from the Actions tab with the new tag name.
+3. The workflow builds all five platforms, publishes the release with `SHA256SUMS` and notes from
+   the changelog. Then update the URLs and checksums in `Formula/local-brain.rb`.
 
 ## Contributing
 
