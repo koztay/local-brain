@@ -225,7 +225,7 @@ pub fn load_or_generate(
     Ok(ts)
 }
 
-#[derive(Serialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct RunResult {
     pub task: String,
     pub config: String,
@@ -240,6 +240,9 @@ pub struct RunResult {
     pub cost_usd: f64,
     pub error: Option<String>,
     pub answer_excerpt: String,
+    /// Which repetition of the task set this run belongs to (`--repeat`).
+    #[serde(default)]
+    pub run: usize,
 }
 
 impl RunResult {
@@ -373,6 +376,7 @@ fn run_claude(
     model: Option<&str>,
     max_turns: u32,
     timeout_s: u64,
+    isolate: bool,
 ) -> RunResult {
     let mut r = RunResult {
         task: task.id.clone(),
@@ -391,6 +395,12 @@ fn run_claude(
             &mcp_config.to_string(),
         ])
         .args(["--allowedTools", "Read,Grep,Glob,LS,Bash,mcp__local-brain"]);
+    if isolate {
+        // Leave out the user's own settings (plugins, hooks, status line): they add the same
+        // large floor to every configuration and hide the differences being measured. Project
+        // settings (graphify's hooks) and --settings (local-brain's) still apply.
+        cmd.args(["--setting-sources", "project,local"]);
+    }
     if let Some(s) = settings {
         cmd.args(["--settings", &s.to_string()]);
     }
@@ -495,6 +505,10 @@ pub struct RunOptions {
     pub max_turns: u32,
     pub timeout_s: u64,
     pub limit: Option<usize>,
+    /// Run the task set this many times per configuration.
+    pub repeat: usize,
+    /// Exclude the user's settings and plugins from the sessions.
+    pub isolate: bool,
 }
 
 /// Run the comparison with real Claude Code sessions.
@@ -573,9 +587,22 @@ pub fn run(
                 continue;
             }
         };
-        for (i, t) in tasks.iter().enumerate() {
-            eprint!("  [{}] {}/{} {} … ", config, i + 1, tasks.len(), t.id);
-            let r = run_claude(
+        for (run, (i, t)) in (0..opts.repeat.max(1))
+            .flat_map(|run| tasks.iter().enumerate().map(move |it| (run, it)))
+        {
+            eprint!(
+                "  [{}] {}{}/{} {} … ",
+                config,
+                if opts.repeat > 1 {
+                    format!("run {} · ", run + 1)
+                } else {
+                    String::new()
+                },
+                i + 1,
+                tasks.len(),
+                t.id
+            );
+            let mut r = run_claude(
                 t,
                 config,
                 &wt.path,
@@ -585,7 +612,9 @@ pub fn run(
                 opts.model.as_deref(),
                 opts.max_turns,
                 opts.timeout_s,
+                opts.isolate,
             );
+            r.run = run;
             eprintln!(
                 "{} · {} tokens · {} tool calls{}",
                 if r.success { "ok" } else { "FAIL" },
@@ -607,6 +636,7 @@ pub fn run(
         &results,
         &claude_version,
         opts.model.as_deref(),
+        opts.isolate,
     )
 }
 
@@ -623,13 +653,19 @@ struct Agg {
     cost_usd: f64,
 }
 
-fn write_report(
-    project: &Project,
-    ts: &TaskSet,
-    results: &[RunResult],
-    claude_version: &str,
-    model: Option<&str>,
-) -> Result<(PathBuf, String)> {
+/// Report header facts.
+struct Meta<'a> {
+    date: String,
+    version: &'a str,
+    claude_version: &'a str,
+    model: Option<&'a str>,
+    tasks: usize,
+    seed: u64,
+    /// None for reports written before isolation existed.
+    isolated: Option<bool>,
+}
+
+fn aggregate(results: &[RunResult]) -> BTreeMap<String, Agg> {
     let mut agg: BTreeMap<String, Agg> = BTreeMap::new();
     for r in results {
         let a = agg.entry(r.config.clone()).or_default();
@@ -643,65 +679,179 @@ fn write_report(
         a.duration_ms += r.duration_ms;
         a.cost_usd += r.cost_usd;
     }
+    agg
+}
+
+/// Tokens a configuration put into the context for the first time: uncached input plus cache
+/// writes. Billed at full (and cache-write) price, unlike cache reads, which cost a small
+/// fraction — so this, not the raw total, is what a context tool has to keep down.
+fn new_tokens(input: i64, cache_write: i64) -> i64 {
+    input + cache_write
+}
+
+fn pct_change(new: f64, base: f64) -> String {
+    if base == 0.0 {
+        return "n/a".into();
+    }
+    format!("{:+.1}%", 100.0 * (new - base) / base)
+}
+
+fn render_md(meta: &Meta, results: &[RunResult]) -> String {
+    let agg = aggregate(results);
     let total = |a: &Agg| a.input + a.output + a.cache_read + a.cache_write;
     let mut md = format!(
-        "# local-brain bench report\n\n- Date: {}\n- local-brain: {}\n- Claude Code: {}\n- Model: {}\n- Task set: {} tasks, seed {}\n\n",
-        util::fmt_ts(util::now()),
-        env!("CARGO_PKG_VERSION"),
-        claude_version,
-        model.unwrap_or("default"),
-        ts.tasks.len(),
-        ts.seed
+        "# local-brain bench report\n\n- Date: {}\n- local-brain: {}\n- Claude Code: {}\n- Model: {}\n- Task set: {} tasks, seed {}, {} run(s) each\n- Sessions: {}\n\n",
+        meta.date,
+        meta.version,
+        meta.claude_version,
+        meta.model.unwrap_or("default"),
+        meta.tasks,
+        meta.seed,
+        runs(results),
+        match meta.isolated {
+            Some(true) => "isolated (user settings and plugins left out)",
+            Some(false) => "with the user's own settings and plugins (adds the same floor to every configuration)",
+            None => "not recorded (before 0.1.7: the user's settings and plugins were loaded)",
+        }
     );
-    md.push_str("| Config | Success | Total tokens | Input | Output | Cache read | Cache write | Tool calls | Time | Cost |\n|---|---|---|---|---|---|---|---|---|---|\n");
-    for (c, a) in &agg {
+    md.push_str(
+        "Ranked by cost. **New tokens** = uncached input + cache writes: text a configuration adds \
+         to the context, billed at full price. Cache reads re-read context the model already has \
+         and cost a small fraction, so the raw total overstates savings that only cut re-reading.\n\n",
+    );
+    md.push_str("| Config | Success | Cost | Cost per run (min–max) | New tokens | Output | Cache read | Total tokens | Tool calls | Time |\n|---|---|---|---|---|---|---|---|---|---|\n");
+    let mut ranked: Vec<(&String, &Agg)> = agg.iter().collect();
+    ranked.sort_by(|a, b| a.1.cost_usd.total_cmp(&b.1.cost_usd));
+    for (c, a) in &ranked {
         md.push_str(&format!(
-            "| {} | {}/{} | {} | {} | {} | {} | {} | {} | {:.0}s | ${:.2} |\n",
+            "| {} | {}/{} | ${:.2} | {} | {} | {} | {} | {} | {} | {:.0}s |\n",
             c,
             a.successes,
             a.tasks,
-            total(a),
-            a.input,
+            a.cost_usd,
+            run_spread(results, c),
+            new_tokens(a.input, a.cache_write),
             a.output,
             a.cache_read,
-            a.cache_write,
+            total(a),
             a.tool_calls,
             a.duration_ms as f64 / 1000.0,
-            a.cost_usd
         ));
     }
-    if let Some(lb) = agg.get("local-brain") {
-        for other in ["graphify", "vanilla"] {
-            if let Some(o) = agg.get(other) {
-                if total(o) > 0 {
-                    let pct = 100.0 * (total(o) - total(lb)) as f64 / total(o) as f64;
-                    md.push_str(&format!(
-                        "\nlocal-brain vs {}: {:+.1}% total tokens ({}), success {}/{} vs {}/{}.",
-                        other,
-                        -pct,
-                        if pct >= 0.0 { "lower" } else { "higher" },
-                        lb.successes,
-                        lb.tasks,
-                        o.successes,
-                        o.tasks
-                    ));
-                }
-            }
-        }
-        md.push('\n');
+    md.push('\n');
+    for (subject, base) in [
+        ("local-brain", "vanilla"),
+        ("local-brain", "graphify"),
+        ("graphify", "vanilla"),
+    ] {
+        let (Some(s), Some(b)) = (agg.get(subject), agg.get(base)) else {
+            continue;
+        };
+        md.push_str(&format!(
+            "- {} vs {}: cost {}, new tokens {}, total tokens {}, success {}/{} vs {}/{}\n",
+            subject,
+            base,
+            pct_change(s.cost_usd, b.cost_usd),
+            pct_change(
+                new_tokens(s.input, s.cache_write) as f64,
+                new_tokens(b.input, b.cache_write) as f64
+            ),
+            pct_change(total(s) as f64, total(b) as f64),
+            s.successes,
+            s.tasks,
+            b.successes,
+            b.tasks
+        ));
     }
-    md.push_str("\n## Per task\n\n| Task | Config | OK | Total tokens | Tool calls | Turns |\n|---|---|---|---|---|---|\n");
+    md.push_str("\n## Per task\n\n| Task | Config | OK | Cost | New tokens | Total tokens | Tool calls | Turns |\n|---|---|---|---|---|---|---|---|\n");
     for r in results {
         md.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | ${:.3} | {} | {} | {} | {} |\n",
             r.task,
             r.config,
             if r.success { "✓" } else { "✗" },
+            r.cost_usd,
+            new_tokens(r.input_tokens, r.cache_write_tokens),
             r.total(),
             r.tool_calls,
             r.turns
         ));
     }
+    md
+}
+
+fn runs(results: &[RunResult]) -> usize {
+    results.iter().map(|r| r.run + 1).max().unwrap_or(1)
+}
+
+/// Cost of each full pass over the task set, as "$min–$max" (or "–" with a single run): when
+/// the ranges of two configurations overlap, their difference is within run-to-run noise.
+fn run_spread(results: &[RunResult], config: &str) -> String {
+    let mut per_run: BTreeMap<usize, f64> = BTreeMap::new();
+    for r in results.iter().filter(|r| r.config == config) {
+        *per_run.entry(r.run).or_default() += r.cost_usd;
+    }
+    if per_run.len() < 2 {
+        return "–".into();
+    }
+    let lo = per_run.values().cloned().fold(f64::INFINITY, f64::min);
+    let hi = per_run.values().cloned().fold(f64::NEG_INFINITY, f64::max);
+    format!("${:.2}–${:.2}", lo, hi)
+}
+
+/// `bench --report <json>`: render a saved run again (e.g. after the report format changed)
+/// without running Claude. Writes the Markdown next to the JSON.
+pub fn rerender(json_path: &Path) -> Result<(PathBuf, String)> {
+    let v: Value = serde_json::from_str(
+        &std::fs::read_to_string(json_path)
+            .with_context(|| format!("reading {}", json_path.display()))?,
+    )?;
+    let results: Vec<RunResult> = serde_json::from_value(v["results"].clone())
+        .context("the report has no readable `results`")?;
+    let date = std::fs::metadata(json_path)
+        .and_then(|m| m.modified())
+        .map(|t| {
+            chrono::DateTime::<chrono::Local>::from(t)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_default();
+    let meta = Meta {
+        date,
+        version: v["version"].as_str().unwrap_or("?"),
+        claude_version: v["claude_version"].as_str().unwrap_or("?"),
+        model: v["model"].as_str(),
+        tasks: v["tasks"].as_array().map_or(0, |t| t.len()),
+        seed: v["seed"].as_u64().unwrap_or(0),
+        isolated: v["isolated"].as_bool(),
+    };
+    let md = render_md(&meta, &results);
+    let md_path = json_path.with_extension("md");
+    std::fs::write(&md_path, &md)?;
+    Ok((md_path, md))
+}
+
+fn write_report(
+    project: &Project,
+    ts: &TaskSet,
+    results: &[RunResult],
+    claude_version: &str,
+    model: Option<&str>,
+    isolated: bool,
+) -> Result<(PathBuf, String)> {
+    let agg = aggregate(results);
+    let md = render_md(
+        &Meta {
+            date: util::fmt_ts(util::now()),
+            version: env!("CARGO_PKG_VERSION"),
+            claude_version,
+            model,
+            tasks: ts.tasks.len(),
+            seed: ts.seed,
+            isolated: Some(isolated),
+        },
+        results,
+    );
     let ts_now = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     std::fs::create_dir_all(project.bench_dir())?;
     let md_path = project.bench_dir().join(format!("report-{}.md", ts_now));
@@ -714,6 +864,7 @@ fn write_report(
             "claude_version": claude_version,
             "model": model,
             "seed": ts.seed,
+            "isolated": isolated,
             "tasks": ts.tasks,
             "aggregates": agg,
             "results": results,
@@ -792,4 +943,51 @@ pub fn offline(project: &Project, cfg: &Config, store: &Store, ts: &TaskSet) -> 
         100.0 * (tv - tl) as f64 / tv.max(1) as f64
     ));
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rr(config: &str, run: usize, cost: f64, cache_write: i64) -> RunResult {
+        RunResult {
+            task: "t".into(),
+            config: config.into(),
+            success: true,
+            cache_write_tokens: cache_write,
+            cache_read_tokens: 100_000,
+            cost_usd: cost,
+            run,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn report_ranks_by_cost_and_shows_run_spread() {
+        let results = vec![
+            rr("vanilla", 0, 0.10, 1000),
+            rr("vanilla", 1, 0.12, 1000),
+            rr("local-brain", 0, 0.08, 800),
+            rr("local-brain", 1, 0.09, 800),
+        ];
+        assert_eq!(run_spread(&results, "vanilla"), "$0.10–$0.12");
+        assert_eq!(run_spread(&results[..1], "vanilla"), "–");
+        let md = render_md(
+            &Meta {
+                date: "d".into(),
+                version: "v",
+                claude_version: "c",
+                model: None,
+                tasks: 1,
+                seed: 1,
+                isolated: Some(true),
+            },
+            &results,
+        );
+        let lb = md.find("| local-brain |").unwrap();
+        let va = md.find("| vanilla |").unwrap();
+        assert!(lb < va, "cheapest configuration first");
+        assert!(md.contains("2 run(s) each"));
+        assert!(md.contains("local-brain vs vanilla: cost -22.7%, new tokens -20.0%"));
+    }
 }

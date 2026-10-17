@@ -160,6 +160,15 @@ enum Cmd {
         /// Only run the first N tasks
         #[arg(long)]
         limit: Option<usize>,
+        /// Re-render a saved report-*.json in the current format (no Claude calls)
+        #[arg(long)]
+        report: Option<PathBuf>,
+        /// Run the task set this many times per configuration and show the spread
+        #[arg(long, default_value_t = 1)]
+        repeat: usize,
+        /// Load your own Claude Code settings and plugins in the sessions (default: left out)
+        #[arg(long)]
+        with_user_settings: bool,
     },
     /// Check runtime, models, hooks and MCP; optionally switch the runtime provider
     Doctor {
@@ -477,7 +486,16 @@ fn real_main(cli: Cli) -> Result<i32> {
             max_turns,
             timeout,
             limit,
+            report,
+            repeat,
+            with_user_settings,
         } => {
+            if let Some(json) = report {
+                let (path, md) = bench::rerender(&json)?;
+                println!("{}", md);
+                eprintln!("Report written to {}", path.display());
+                return Ok(0);
+            }
             let p = paths::resolve_project(None)?;
             let cfg = config::Config::load(Some(&p));
             let st = store::Store::open(&p)?;
@@ -512,6 +530,8 @@ fn real_main(cli: Cli) -> Result<i32> {
                     max_turns,
                     timeout_s: timeout,
                     limit,
+                    repeat,
+                    isolate: !with_user_settings,
                 };
                 eprintln!("Running real Claude Code sessions in disposable worktrees (this uses your Claude plan/API credits).");
                 let (path, md) = bench::run(&p, &cfg, &ts, &opts)?;

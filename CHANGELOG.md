@@ -13,6 +13,16 @@ All notable changes to this project are documented here. The format follows
   as the status line only when none is configured, and otherwise prints the line to add to your
   own script.
 
+### Changed
+- `bench` reports rank configurations by cost and lead with **new tokens** (uncached input +
+  cache writes, billed at full price). The old headline, total tokens, is dominated by cheap
+  cache reads and showed savings that cost more. `bench --report <json>` re-renders a saved run.
+- `bench` sessions leave out the user's own Claude Code settings and plugins
+  (`--setting-sources project,local`); with plugins installed they added the same ~10k-token
+  floor to every configuration and hid the differences. `--with-user-settings` restores them.
+- `bench --repeat N` runs the task set N times and shows each configuration's cost range, so
+  run-to-run noise can be told apart from real differences.
+
 ### Fixed
 - The per-prompt context note was also added to prompts Claude Code generates itself
   (background-task and monitor notifications, local command output), about 450 tokens each
