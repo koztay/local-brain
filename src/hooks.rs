@@ -95,7 +95,13 @@ pub fn handle(event: &str, v: &Value) -> Result<Option<Value>> {
             session_start(&project, &cfg, &store, &session)
         }
         ("user-prompt-submit", _) if cfg.hooks.prompt_context => {
-            prompt_context(&cfg, &store, &session, v["prompt"].as_str().unwrap_or(""))
+            prompt_context(
+                &project,
+                &cfg,
+                &store,
+                &session,
+                v["prompt"].as_str().unwrap_or(""),
+            )
         }
         ("stop", _) if cfg.hooks.session_memory => {
             remember_pending(&store, &session, v["transcript_path"].as_str())?;
@@ -202,6 +208,11 @@ fn post_read(
         if escape(store, session, &key)? {
             return Ok(None);
         }
+        // The prompt's note already carried this document's local description; a Read after
+        // that is a request for the pixels.
+        if store.recently_denied(session, &format!("noted:{}", path), RETRY_WINDOW)? {
+            return Ok(None);
+        }
         let mut c = cfg.clone();
         c.runtime.timeout_secs = c.runtime.timeout_secs.min(100);
         let llm = Llm::new(&c);
@@ -212,6 +223,10 @@ fn post_read(
                 return Ok(None);
             }
         };
+        // A small image costs Claude less than its description would; let it through.
+        if crate::docs::is_image(&path) && d.baseline_tokens <= util::tokens(&d.text) + 60 {
+            return Ok(None);
+        }
         store.record_denial(session, &key)?;
         store.record_metric(
             "hook",
@@ -223,10 +238,8 @@ fn post_read(
         return Ok(Some(text_result(
             fp,
             format!(
-                "[local-brain] Read locally to save image/PDF tokens. For a specific question use \
-                 brain_doc(path, question). The description comes from a small local model: when exact \
-                 text, numbers or pixel-level layout matter, get the original image with Read and \
-                 offset: 1.\n\n{}\n",
+                "[local-brain] Read locally (no image tokens). For exact text, numbers or layout, \
+                 Read again with offset: 1 to get the original.\n\n{}\n",
                 d.text
             ),
         )));
@@ -957,10 +970,391 @@ fn matching_areas(store: &Store, terms: &[String]) -> Result<Vec<Area>> {
     Ok(areas)
 }
 
-/// UserPromptSubmit: tell Claude where the code for this request lives — matching areas of the
-/// tree, the most relevant code files with key symbols, then related docs — within
-/// `prompt_context_tokens`.
+/// Code identifiers a prompt names: everything in backticks, plus bare words shaped like
+/// identifiers (camelCase, snake_case, Type.member). Returns (identifier, was_backticked).
+fn prompt_identifiers(prompt: &str) -> Vec<(String, bool)> {
+    use std::sync::OnceLock;
+    static TICK: OnceLock<Regex> = OnceLock::new();
+    static WORD: OnceLock<Regex> = OnceLock::new();
+    let tick = TICK.get_or_init(|| Regex::new(r"`([^`\s]{2,80})`").unwrap());
+    let word = WORD.get_or_init(|| Regex::new(r"\b[A-Za-z_][A-Za-z0-9_.]{2,79}\b").unwrap());
+    let shaped = |w: &str| {
+        let inner_upper = w.chars().skip(1).any(|c| c.is_ascii_uppercase());
+        let lower = w.chars().any(|c| c.is_ascii_lowercase());
+        (w.contains('_') && w.chars().any(|c| c.is_alphanumeric()))
+            || (w.contains('.') && !w.ends_with('.') && w.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false))
+            || (inner_upper && lower)
+    };
+    let mut out: Vec<(String, bool)> = Vec::new();
+    let mut push = |s: &str, ticked: bool| {
+        let s = s.trim().trim_end_matches("()").trim_matches(|c: char| c == ',' || c == '.' || c == ';' || c == ':');
+        if s.chars().count() >= 2 && !out.iter().any(|(o, _)| o == s) && out.len() < 6 {
+            out.push((s.to_string(), ticked));
+        }
+    };
+    for m in tick.captures_iter(prompt) {
+        push(&m[1], true);
+    }
+    for m in word.find_iter(prompt) {
+        if shaped(m.as_str()) {
+            push(m.as_str(), false);
+        }
+    }
+    out
+}
+
+/// A symbol the prompt names, resolved in the code graph.
+struct Named {
+    defs: Vec<crate::store::SymbolRow>,
+    callers: Vec<crate::store::EdgeRow>,
+}
+
+fn resolve_identifiers(store: &Store, ids: &[(String, bool)]) -> Result<Vec<Named>> {
+    let mut out: Vec<Named> = Vec::new();
+    let ident = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+    };
+    for (id, ticked) in ids {
+        if id.contains('/') {
+            continue; // a file path, handled by prompt_paths
+        }
+        let mut defs = store.symbols_best(id)?;
+        if defs.is_empty() && *ticked {
+            // `Parser.parse` → parse, preferably inside Parser.
+            if let Some((parent, member)) = id.rsplit_once('.').filter(|(p, m)| ident(p) && ident(m)) {
+                let all = store.symbols_best(member)?;
+                let inside: Vec<_> = all
+                    .iter()
+                    .filter(|s| s.parent.as_deref() == Some(parent))
+                    .cloned()
+                    .collect();
+                defs = if inside.is_empty() { all } else { inside };
+            }
+        }
+        if defs.is_empty() {
+            continue;
+        }
+        if out
+            .iter()
+            .any(|n| n.defs.first().map(|d| d.name == defs[0].name).unwrap_or(false))
+        {
+            continue;
+        }
+        defs.sort_by_key(|s| (is_test_path(&s.path), s.path.clone(), s.start_line));
+        let mut callers = store.edges_to(&defs[0].name, "call")?;
+        callers.sort_by_key(|e| (is_test_path(&e.path), e.path.clone(), e.line));
+        out.push(Named { defs, callers });
+        if out.len() >= 4 {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+fn asks_for_callers(prompt: &str) -> bool {
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(call|calls|caller|callers|called|calling|use|uses|used|usage|usages|reference|references|referenced|import|imports|imported|invoke|invokes|invoked|depends? on|kullan\w*|çağ\w*)\b").unwrap()
+    })
+    .is_match(prompt)
+}
+
+fn asks_for_architecture(prompt: &str) -> bool {
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(architecture|architectural|overview|high.level|structure of|structured|organi[sz]ed|organi[sz]ation|main (directories|modules|parts|components)|entry points?|how (is|does) (this|the) (repo|repository|project|codebase)|mimari\w*|yapısı\w*)\b").unwrap()
+    })
+    .is_match(prompt)
+}
+
+fn asks_for_docs(prompt: &str) -> bool {
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(doc|docs|document|documentation|documented|spec|specs|specification|plan|plans|readme|guide|handoff|design|notes?|belge\w*|döküman\w*|dokümantasyon)\b").unwrap()
+    })
+    .is_match(prompt)
+}
+
+/// The note for symbols the prompt names: where each is defined (kind, file:lines, signature)
+/// and, when the prompt asks about uses, where it is called from. Nothing else: Claude can go
+/// straight to the code instead of searching for it.
+fn render_symbols(project: &Project, named: &[Named], want_callers: bool, budget: i64) -> String {
+    let mut out = String::from(
+        "local-brain (code index) resolved the symbols named in this prompt; no search needed. \
+         More code: Read with offset/limit, or brain_slice.\n",
+    );
+    let fits = |out: &str, line: &str| util::tokens(out) + util::tokens(line) <= budget;
+    for n in named {
+        for (i, d) in n.defs.iter().take(3).enumerate() {
+            let sig = util::clip(d.signature.trim(), 110);
+            let line = format!(
+                "- `{}` — {}{} at {}:{}-{}{}\n",
+                d.name,
+                d.kind,
+                d.parent
+                    .as_deref()
+                    .map(|p| format!(" in {}", p))
+                    .unwrap_or_default(),
+                d.path,
+                d.start_line,
+                d.end_line,
+                if sig.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", sig)
+                }
+            );
+            if !fits(&out, &line) {
+                return out;
+            }
+            out.push_str(&line);
+            // A short definition is quoted whole: the question is usually answered right there.
+            if i == 0 && d.end_line - d.start_line < 14 {
+                if let Some(src) = short_source(project, &d.path, d.start_line, d.end_line) {
+                    if fits(&out, &src) {
+                        out.push_str(&src);
+                    }
+                }
+            }
+        }
+        if n.defs.len() > 3 {
+            let line = format!("  (+{} more definitions named the same)\n", n.defs.len() - 3);
+            if fits(&out, &line) {
+                out.push_str(&line);
+            }
+        }
+        if n.callers.is_empty() {
+            continue;
+        }
+        // Call sites grouped by file, code before tests.
+        let mut groups: Vec<(String, Vec<String>, Option<String>)> = Vec::new();
+        for e in &n.callers {
+            match groups.iter_mut().find(|g| g.0 == e.path) {
+                Some(g) => g.1.push(e.line.to_string()),
+                None => groups.push((e.path.clone(), vec![e.line.to_string()], e.source.clone())),
+            }
+        }
+        let max = if want_callers { 12 } else { 3 };
+        let parts: Vec<String> = groups
+            .iter()
+            .take(max)
+            .map(|(p, lines, src)| {
+                format!(
+                    "{}:{}{}{}",
+                    p,
+                    lines.join(","),
+                    src.as_deref()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| format!(" (in {})", s))
+                        .unwrap_or_default(),
+                    if is_test_path(p) { " [test]" } else { "" }
+                )
+            })
+            .collect();
+        let line = format!(
+            "  called from {} place{} in {} file{}: {}{}\n",
+            n.callers.len(),
+            if n.callers.len() == 1 { "" } else { "s" },
+            groups.len(),
+            if groups.len() == 1 { "" } else { "s" },
+            parts.join("; "),
+            if groups.len() > max {
+                format!("; +{} more files", groups.len() - max)
+            } else {
+                String::new()
+            }
+        );
+        if fits(&out, &line) {
+            out.push_str(&line);
+        }
+    }
+    out
+}
+
+/// Lines `start..=end` of a project file, indented as a quote, when they are small enough to be
+/// worth more than a pointer (≤ 900 characters, secrets masked).
+fn short_source(project: &Project, rel: &str, start: i64, end: i64) -> Option<String> {
+    let text = util::read_text(&project.root.join(rel))?;
+    let lines: Vec<&str> = text
+        .lines()
+        .skip((start.max(1) - 1) as usize)
+        .take((end - start + 1).max(1) as usize)
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let indent = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    let body: Vec<String> = lines
+        .iter()
+        .map(|l| format!("    {}", util::clip(l.get(indent..).unwrap_or("").trim_end(), 160)))
+        .collect();
+    let src = body.join("\n");
+    if src.len() > 900 {
+        return None;
+    }
+    Some(format!("{}\n", crate::secrets::mask(&src)))
+}
+
+/// The note for "how is this repository organized" prompts: the architecture map the index
+/// already has (languages, entry points, modules), so Claude does not have to explore the tree.
+fn render_architecture(store: &Store, budget: i64) -> Result<Option<String>> {
+    let Some((arch, ..)) = store.summary("architecture", ".")? else {
+        return Ok(None);
+    };
+    let mut out = String::from("local-brain (local code index): repository map.\n");
+    if let Some((s, ..)) = store.summary("project", ".")? {
+        let first = crate::memory::first_sentences(&s, 240);
+        if !first.is_empty() {
+            out.push_str(&format!("Overview: {}\n", first));
+        }
+    }
+    // The map is the whole answer here, so it may use half again the usual budget.
+    let budget = budget * 3 / 2;
+    let fits = |out: &str, line: &str| util::tokens(out) + util::tokens(line) <= budget;
+    for l in arch.lines().filter(|l| !l.starts_with("Most referenced")) {
+        let line = if let Some(rest) = l.strip_prefix("  ") {
+            // "  apps/ (631 · 0 · 0)" → the module with what it is for.
+            let dir = rest.split(' ').next().unwrap_or("").trim_end_matches('/');
+            let files = rest
+                .split('(')
+                .nth(1)
+                .and_then(|x| x.split([' ', ')']).next())
+                .unwrap_or("");
+            let what = store
+                .summary("module", dir)?
+                .map(|(t, ..)| crate::memory::first_sentences(&t, 150))
+                .unwrap_or_default();
+            if what.is_empty() && dir.contains('.') {
+                continue; // a top-level file, not a module
+            }
+            format!("  {}/ ({} files) — {}\n", dir, files, what)
+        } else if l.starts_with("Modules") {
+            "Modules:\n".to_string()
+        } else {
+            format!("{}\n", l.trim_end())
+        };
+        if !fits(&out, &line) {
+            break;
+        }
+        out.push_str(&line);
+    }
+    Ok(Some(out))
+}
+
+/// Files a prompt names (`docs/brand/preview.png`, `src/main.rs`), as paths the index knows.
+/// Absolute paths are tried with their leading directories stripped.
+fn prompt_paths(store: &Store, prompt: &str) -> Result<Vec<String>> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r#"(?:^|[\s`'"(])((?:\./)?[A-Za-z0-9_@.\-\[\]~]+(?:/[A-Za-z0-9_@.\-\[\]]+)+\.[A-Za-z0-9]{1,8})"#).unwrap()
+    });
+    let mut out: Vec<String> = Vec::new();
+    for c in re.captures_iter(prompt) {
+        let raw = c[1].trim_start_matches("./").to_string();
+        let mut candidates = vec![raw.clone()];
+        let mut rest = raw.as_str();
+        while let Some((_, tail)) = rest.split_once('/') {
+            candidates.push(tail.to_string());
+            rest = tail;
+        }
+        for cand in candidates {
+            let known = store.file(&cand)?.is_some() || store.doc(&cand)?.is_some();
+            if known {
+                if !out.contains(&cand) {
+                    out.push(cand);
+                }
+                break;
+            }
+        }
+        if out.len() >= 4 {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Append what the index knows about each named file: a document's local description (so the
+/// image or PDF need not be sent at all), or a code file's summary and key symbols.
+fn render_paths(
+    store: &Store,
+    session: &str,
+    paths: &[String],
+    out: &mut String,
+    budget: i64,
+) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    if out.is_empty() {
+        out.push_str("local-brain (local code index): the files named in this prompt.\n");
+    }
+    for p in paths {
+        let room = ((budget - util::tokens(out)) * 4).max(200) as usize;
+        if let Some((_, text, model)) = store.doc(p)? {
+            let kind = if p.to_lowercase().ends_with(".pdf") { "PDF" } else { "image" };
+            // A Read of this file in this session then returns the original, not this again.
+            store.record_denial(session, &format!("noted:{}", p))?;
+            // Images get the gist only: Claude's own look at an image costs ~50–1,600 tokens
+            // and is more reliable than a small model's transcription, so a long description
+            // here would be paid twice. PDFs (text plus ~1,500 tokens a page) get the room.
+            let max = if kind == "PDF" { room.min(1600) } else { 300 };
+            out.push_str(&format!(
+                "- {} ({}, described locally by {}; Read the file to see it): {}\n",
+                p,
+                kind,
+                model,
+                util::clip(&crate::memory::first_sentences(&text, max), max)
+            ));
+            continue;
+        }
+        if let Some(f) = store.file(p)? {
+            let summary = store
+                .summary("file", p)?
+                .map(|(t, ..)| crate::memory::first_sentences(&t, 160))
+                .unwrap_or_default();
+            let syms: Vec<String> = store
+                .symbols_in_file(f.id)?
+                .iter()
+                .filter(|s| s.parent.is_none())
+                .take(4)
+                .map(|s| format!("`{}` ({}-{})", s.name, s.start_line, s.end_line))
+                .collect();
+            let line = format!(
+                "- {} ({} lines) — {}{}\n",
+                p,
+                f.lines,
+                summary,
+                if syms.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Key: {}.", syms.join(", "))
+                }
+            );
+            if util::tokens(out) + util::tokens(&line) <= budget {
+                out.push_str(&line);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// UserPromptSubmit: tell Claude where the code for this request lives, within
+/// `prompt_context_tokens`. Symbols named in the prompt are resolved exactly in the code graph
+/// (definition and call sites); architecture questions get the repository map; other task
+/// prompts get the matching areas of the tree and the most relevant code files.
 fn prompt_context(
+    project: &Project,
     cfg: &Config,
     store: &Store,
     session: &str,
@@ -968,6 +1362,29 @@ fn prompt_context(
 ) -> Result<Option<Value>> {
     if !is_task_prompt(prompt) || store.meta("last_learn")?.is_none() {
         return Ok(None);
+    }
+    let budget = cfg.hooks.prompt_context_tokens.max(150);
+    let done = |out: String| -> Result<Option<Value>> {
+        store.record_metric("hook", "prompt_context", 0, util::tokens(&out), Some(session))?;
+        Ok(Some(json!({
+            "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": out}
+        })))
+    };
+    let named = resolve_identifiers(store, &prompt_identifiers(prompt))?;
+    let paths = prompt_paths(store, prompt)?;
+    if !named.is_empty() || !paths.is_empty() {
+        let mut out = if named.is_empty() {
+            String::new()
+        } else {
+            render_symbols(project, &named, asks_for_callers(prompt), budget)
+        };
+        render_paths(store, session, &paths, &mut out, budget)?;
+        return done(out);
+    }
+    if asks_for_architecture(prompt) {
+        if let Some(out) = render_architecture(store, budget)? {
+            return done(out);
+        }
     }
     let mut c = cfg.clone();
     // Embedding the prompt must not hold the user up; lexical search still works without it.
@@ -1020,18 +1437,16 @@ fn prompt_context(
         .filter(|p| kind_of.get(*p).map(|k| k != "code").unwrap_or(false))
         .collect();
 
-    let budget = cfg.hooks.prompt_context_tokens.max(150);
     let mut out = String::from(
-        "local-brain context (local index of this repo): where the code for this request lives. \
-         Start from here; use `brain_query` to find more and `brain_slice` to read one symbol \
-         instead of whole files.\n",
+        "local-brain (local code index): where the code for this request lives. Start here; \
+         `brain_query` finds more, `brain_slice` reads one symbol.\n",
     );
     let fits = |out: &str, line: &str| util::tokens(out) + util::tokens(line) <= budget;
     let mut shown = 0;
     let file_line = |path: &str| -> Result<String> {
         let summary = store
             .summary("file", path)?
-            .map(|(t, ..)| util::clip(&t.replace('\n', " "), 160))
+            .map(|(t, ..)| util::clip(&crate::memory::first_sentences(&t, 140), 140))
             .unwrap_or_default();
         Ok(format!(
             "- {} — {}{}\n",
@@ -1071,8 +1486,8 @@ fn prompt_context(
         }
     }
     let best = code.first().map(|p| score[*p]).unwrap_or(0.0);
-    for (i, path) in code.iter().filter(|p| !in_area(p)).take(5).enumerate() {
-        if i >= 2 && score[*path] < best * 0.35 {
+    for (i, path) in code.iter().filter(|p| !in_area(p)).take(3).enumerate() {
+        if i >= 1 && score[*path] < best * 0.35 {
             break;
         }
         let line = file_line(path)?;
@@ -1091,27 +1506,22 @@ fn prompt_context(
         out.push_str(&line);
         shown += 1;
     }
-    for path in docs.iter().take(2) {
-        let line = file_line(path)?.replacen("- ", "- doc ", 1);
-        if !fits(&out, &line) {
-            break;
+    // Documents only when the prompt is about them: plans and specs are long and rarely the
+    // place to start a code task.
+    if asks_for_docs(prompt) {
+        for path in docs.iter().take(1) {
+            let line = file_line(path)?.replacen("- ", "- doc ", 1);
+            if !fits(&out, &line) {
+                break;
+            }
+            out.push_str(&line);
+            shown += 1;
         }
-        out.push_str(&line);
-        shown += 1;
     }
     if shown == 0 {
         return Ok(None);
     }
-    store.record_metric(
-        "hook",
-        "prompt_context",
-        0,
-        util::tokens(&out),
-        Some(session),
-    )?;
-    Ok(Some(json!({
-        "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": out}
-    })))
+    done(out)
 }
 
 fn session_start(
@@ -1172,6 +1582,28 @@ mod tests {
         assert!(is_task_prompt(
             "<div class=\"card\"> this card overflows on mobile, fix the admin layout"
         ));
+    }
+
+    #[test]
+    fn prompt_identifiers_and_intents() {
+        let ids = prompt_identifiers(
+            "Where is `createSafeFetch` defined, and who calls listMyRsvps or `Parser.parse()`? The admin page is slow.",
+        );
+        let names: Vec<&str> = ids.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["createSafeFetch", "Parser.parse", "listMyRsvps"]);
+        assert!(prompt_identifiers("Summarize `docs/brand/preview.png`")
+            .iter()
+            .all(|(n, _)| n.contains('/')), "paths are left to prompt_paths");
+        assert!(ids[0].1 && !ids[2].1, "backticks are remembered");
+        assert!(prompt_identifiers("improve the admin panel pages").is_empty());
+        assert!(asks_for_callers("Which files call `listMyRsvps`?"));
+        assert!(!asks_for_callers("Where is `rateHit` defined?"));
+        assert!(asks_for_architecture(
+            "Describe the architecture of this repository: main directories and entry points"
+        ));
+        assert!(!asks_for_architecture("Where is `rateHit` defined?"));
+        assert!(asks_for_docs("Which spec covers the RSVP flow?"));
+        assert!(!asks_for_docs("fix the rateHit rate limiter"));
     }
 
     #[test]

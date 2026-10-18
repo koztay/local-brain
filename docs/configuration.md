@@ -64,15 +64,15 @@ regardless of these settings.
 | `grep` / `glob` | `true` | Rank and trim oversized search results |
 | `session_brief` | `true` | Inject the project brief at session start |
 | `session_memory` | `true` | Summarize sessions into memory |
-| `prompt_context` | `true` | Add where-the-code-lives context to task prompts (UserPromptSubmit) |
+| `prompt_context` | `true` | Add a note to task prompts: the symbols they name resolved to file:lines (definition and call sites), the repository map for architecture questions, or the matching areas and files (UserPromptSubmit) |
 | `read_outside_docs` | `true` | Also read images/PDFs outside the project locally (screenshots in `~/Desktop`, …) |
 | `large_file_lines` | `600` | Line threshold for "large file" |
 | `large_file_tokens` | `8000` | Token threshold for "large file" |
 | `grep_max_results` | `80` | Grep results (lines or files) above this are trimmed |
 | `grep_show` | `30` | How many ranked results are shown |
 | `glob_max_results` | `200` | Glob matches above this are trimmed |
-| `brief_tokens` | `500` | Budget of the session brief |
-| `prompt_context_tokens` | `600` | Budget of the per-prompt context note |
+| `brief_tokens` | `350` | Budget of the session brief |
+| `prompt_context_tokens` | `350` | Budget of the per-prompt context note |
 
 Bash outputs of test/build/lint/install/log commands are compressed above `threshold_tokens`;
 other commands above 2× that; read-like commands (`cat`, `head`, `git diff`, …) only above 10×.

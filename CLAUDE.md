@@ -1,14 +1,12 @@
 <!-- local-brain:start -->
 ## local-brain (local project brain)
 
-This project is indexed by local-brain, a local index of this codebase that costs no cloud
-tokens. Use it for every task (features, fixes, refactors, reviews), not only for questions:
-- Prompts may arrive with a "local-brain context" note listing the most relevant files. Start there.
-- To locate code for a task, ask `brain_query` (e.g. "admin panel pages and their layout components")
-  before exploring with Glob/Grep/Read.
-- Read only what you need with `brain_slice` (one symbol or a line range). Read a whole file only
-  when you are about to change most of it.
-- Image and PDF files are read locally: use `brain_doc` (or Read, which local-brain intercepts).
-- Long command outputs are compressed; get the full text with `brain_raw` and the given `raw_id`.
-- Record important technical decisions with `brain_memory` (action `note`).
+This project is indexed by local-brain (a local code index, no cloud tokens). Use it for every task:
+- Task prompts come with a `local-brain` note: the named symbols' definitions and call sites
+  (file:lines, often the code itself) or the files where the work belongs. Trust it; go there
+  directly instead of searching.
+- Read code in ranges (Read `offset`/`limit`, or `brain_slice` for one symbol), whole files only
+  to rewrite them. Ask `brain_query` for what the note does not answer (how does X work).
+- Images/PDFs: use Read; local-brain returns a local description. Long command outputs are
+  compressed (`brain_raw` + `raw_id` for the full text). Record decisions with `brain_memory`.
 <!-- local-brain:end -->

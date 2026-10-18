@@ -98,7 +98,7 @@ pub fn baseline_tokens(path: &str, bytes: &[u8], text_tokens: i64) -> i64 {
         let scale = ((1_150_000.0 / (w as f64 * h as f64)).sqrt()).min(1.0);
         (((w as f64 * scale) * (h as f64 * scale)) / 750.0)
             .round()
-            .max(200.0) as i64
+            .max(50.0) as i64
     } else {
         // PDFs are sent as text plus an image per page.
         text_tokens + pdf_pages(bytes) as i64 * 1500

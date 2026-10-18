@@ -243,6 +243,9 @@ pub struct RunResult {
     /// Which repetition of the task set this run belongs to (`--repeat`).
     #[serde(default)]
     pub run: usize,
+    /// The model the session actually ran on (Claude Code's default when `--model` is not given).
+    #[serde(default)]
+    pub model: String,
 }
 
 impl RunResult {
@@ -282,15 +285,6 @@ fn verify(task: &Task, answer: &str, worktree: &Path) -> bool {
     !answer.trim().is_empty()
 }
 
-fn hooks_settings(exe: &str) -> Value {
-    let h = |ev: &str, t: u64| json!([{"hooks": [{"type": "command", "command": format!("{} hook {}", util::sh_quote(exe), ev), "timeout": t}]}]);
-    let mut pre = h("pre-tool-use", 120);
-    pre[0]["matcher"] = json!("Read|Grep|Glob");
-    let mut post = h("post-tool-use", 60);
-    post[0]["matcher"] = json!("Bash");
-    json!({"hooks": {"PreToolUse": pre, "PostToolUse": post, "SessionStart": h("session-start", 20)}})
-}
-
 fn strip_claude_md_section(worktree: &Path) {
     let p = worktree.join("CLAUDE.md");
     if let Ok(s) = std::fs::read_to_string(&p) {
@@ -304,6 +298,42 @@ fn strip_claude_md_section(worktree: &Path) {
             );
         }
     }
+}
+
+/// Commit a configuration's files (graphify's index and CLAUDE.md section, local-brain's
+/// section) in the detached worktree, so that resetting between tasks keeps them. 0.1.7 reset
+/// with `git clean`, which deleted graphify's untracked files after the first task: 17 of 18
+/// "graphify" sessions were really vanilla. Every configuration gets exactly one such commit, so
+/// the git snapshot Claude Code shows is the same shape for all.
+fn commit_setup(wt: &Path) {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(wt)
+            .args(args)
+            .output()
+    };
+    let _ = git(&[
+        "add",
+        "-A",
+        "--",
+        ".",
+        &format!(":(exclude){}", paths::PROJECT_DIR),
+    ]);
+    let _ = git(&[
+        "-c",
+        "user.name=local-brain bench",
+        "-c",
+        "user.email=bench@local-brain",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "--no-verify",
+        "--allow-empty",
+        "-m",
+        "local-brain bench: configuration setup",
+    ]);
 }
 
 struct Worktree {
@@ -372,7 +402,6 @@ fn run_claude(
     wt: &Path,
     mcp_config: &Value,
     settings: Option<&Value>,
-    append: Option<&str>,
     model: Option<&str>,
     max_turns: u32,
     timeout_s: u64,
@@ -406,9 +435,6 @@ fn run_claude(
     }
     if let Some(s) = settings {
         cmd.args(["--settings", &s.to_string()]);
-    }
-    if let Some(a) = append {
-        cmd.args(["--append-system-prompt", a]);
     }
     if let Some(m) = model {
         cmd.args(["--model", m]);
@@ -458,6 +484,9 @@ fn run_claude(
             continue;
         };
         match v["type"].as_str() {
+            Some("system") if v["subtype"] == "init" => {
+                r.model = v["model"].as_str().unwrap_or("").to_string();
+            }
             Some("assistant") => {
                 if let Some(blocks) = v["message"]["content"].as_array() {
                     r.tool_calls +=
@@ -555,16 +584,19 @@ pub fn run(
     let mut results: Vec<RunResult> = Vec::new();
     let empty_mcp = json!({"mcpServers": {}});
     let _ = cfg;
+    struct Setup {
+        config: String,
+        wt: Worktree,
+        mcp: Value,
+        settings: Option<Value>,
+    }
+    let mut setups: Vec<Setup> = Vec::new();
     for config in &opts.configs {
         let wt = Worktree::create(&project.root, &scratch.join(config))?;
-        let (mcp, settings, append): (Value, Option<Value>, Option<String>) = match config.as_str()
-        {
-            "vanilla" => {
-                strip_claude_md_section(&wt.path);
-                (empty_mcp.clone(), Some(json!({"hooks": {}})), None)
-            }
+        strip_claude_md_section(&wt.path);
+        let (mcp, settings): (Value, Option<Value>) = match config.as_str() {
+            "vanilla" => (empty_mcp.clone(), Some(json!({"hooks": {}}))),
             "graphify" => {
-                strip_claude_md_section(&wt.path);
                 let Some(setup) = &opts.graphify_setup else {
                     eprintln!("  skipping graphify: pass --graphify-setup \"<command that installs graphify into the current repo>\"");
                     continue;
@@ -586,17 +618,26 @@ pub fn run(
                     .ok()
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or(empty_mcp.clone());
-                (mcp, None, None)
+                (mcp, None)
             }
             "local-brain" => {
-                strip_claude_md_section(&wt.path);
+                // Exactly what `local-brain init` installs: the hooks, the CLAUDE.md section and
+                // the MCP server (always loaded, as the server itself asks).
                 #[cfg(unix)]
                 std::os::unix::fs::symlink(project.dir(), wt.path.join(paths::PROJECT_DIR))?;
                 #[cfg(not(unix))]
                 bail!("bench for local-brain currently needs a Unix-like OS");
-                let mcp = json!({"mcpServers": {"local-brain": {"command": exe, "args": ["mcp", "--project", wt.path]}}});
-                let section = "This project is indexed by local-brain. For questions about the code use brain_query first; fetch code with brain_slice instead of reading whole files; read images/PDFs with brain_doc; get full compressed outputs with brain_raw.";
-                (mcp, Some(hooks_settings(&exe)), Some(section.to_string()))
+                crate::integrate::ensure_claude_md_section(&wt.path)?;
+                let mcp = json!({"mcpServers": {"local-brain": {
+                    "command": exe, "args": ["mcp", "--project", wt.path], "alwaysLoad": true
+                }}});
+                // Without the memory hooks: they cost no tokens, and summaries of benchmark
+                // sessions would otherwise land in the project's real memory.
+                let mut hooks = crate::integrate::hooks_settings(&exe);
+                for ev in ["Stop", "SessionEnd"] {
+                    hooks["hooks"].as_object_mut().map(|o| o.remove(ev));
+                }
+                (mcp, Some(hooks))
             }
             other => {
                 eprintln!(
@@ -606,52 +647,69 @@ pub fn run(
                 continue;
             }
         };
-        for (run, (i, t)) in (0..opts.repeat.max(1))
-            .flat_map(|run| tasks.iter().enumerate().map(move |it| (run, it)))
-        {
-            eprint!(
-                "  [{}] {}{}/{} {} … ",
-                config,
-                if opts.repeat > 1 {
-                    format!("run {} · ", run + 1)
-                } else {
-                    String::new()
-                },
-                i + 1,
-                tasks.len(),
-                t.id
-            );
-            let mut r = run_claude(
-                t,
-                config,
-                &wt.path,
-                &mcp,
-                settings.as_ref(),
-                append.as_deref(),
-                opts.model.as_deref(),
-                opts.max_turns,
-                opts.timeout_s,
-                opts.isolate,
-                transcripts
-                    .as_ref()
-                    .map(|d| d.join(format!("{}-{}-r{}.jsonl", config, t.id, run + 1)))
-                    .as_deref(),
-            );
-            r.run = run;
-            eprintln!(
-                "{} · {} tokens · {} tool calls{}",
-                if r.success { "ok" } else { "FAIL" },
-                util::human_tokens(r.total()),
-                r.tool_calls,
-                r.error
-                    .as_ref()
-                    .map(|e| format!(" · {}", e))
-                    .unwrap_or_default()
-            );
-            results.push(r);
-            wt.reset();
+        commit_setup(&wt.path);
+        setups.push(Setup {
+            config: config.clone(),
+            wt,
+            mcp,
+            settings,
+        });
+    }
+    // Interleaved: every task runs under each configuration back to back. Sessions of one
+    // configuration are then spread over the whole run, so prompt-cache timing (the 1-hour
+    // cache of the system prompt) favours none of them.
+    let repeat = opts.repeat.max(1);
+    let total = repeat * tasks.len() * setups.len();
+    let mut n = 0;
+    for run in 0..repeat {
+        for t in tasks.iter() {
+            for s in &setups {
+                n += 1;
+                eprint!(
+                    "  [{}/{}] {}{} · {} … ",
+                    n,
+                    total,
+                    if repeat > 1 {
+                        format!("run {} · ", run + 1)
+                    } else {
+                        String::new()
+                    },
+                    t.id,
+                    s.config
+                );
+                let mut r = run_claude(
+                    t,
+                    &s.config,
+                    &s.wt.path,
+                    &s.mcp,
+                    s.settings.as_ref(),
+                    opts.model.as_deref(),
+                    opts.max_turns,
+                    opts.timeout_s,
+                    opts.isolate,
+                    transcripts
+                        .as_ref()
+                        .map(|d| d.join(format!("{}-{}-r{}.jsonl", s.config, t.id, run + 1)))
+                        .as_deref(),
+                );
+                r.run = run;
+                eprintln!(
+                    "{} · ${:.3} · {} new tokens · {} tool calls{}",
+                    if r.success { "ok" } else { "FAIL" },
+                    r.cost_usd,
+                    util::human_tokens(new_tokens(r.input_tokens, r.cache_write_tokens)),
+                    r.tool_calls,
+                    r.error
+                        .as_ref()
+                        .map(|e| format!(" · {}", e))
+                        .unwrap_or_default()
+                );
+                results.push(r);
+                s.wt.reset();
+            }
         }
     }
+    drop(setups);
     let _ = std::fs::remove_dir_all(&scratch);
     write_report(
         project,
@@ -686,6 +744,8 @@ struct Meta<'a> {
     seed: u64,
     /// None for reports written before isolation existed.
     isolated: Option<bool>,
+    /// Whether configurations were interleaved per task (None: older report, sequential).
+    interleaved: Option<bool>,
 }
 
 fn aggregate(results: &[RunResult]) -> BTreeMap<String, Agg> {
@@ -723,11 +783,24 @@ fn render_md(meta: &Meta, results: &[RunResult]) -> String {
     let agg = aggregate(results);
     let total = |a: &Agg| a.input + a.output + a.cache_read + a.cache_write;
     let mut md = format!(
-        "# local-brain bench report\n\n- Date: {}\n- local-brain: {}\n- Claude Code: {}\n- Model: {}\n- Task set: {} tasks, seed {}, {} run(s) each\n- Sessions: {}\n\n",
+        "# local-brain bench report\n\n- Date: {}\n- local-brain: {}\n- Claude Code: {}\n- Model: {}\n- Task set: {} tasks, seed {}, {} run(s) each\n- Sessions: {}\n- Order: {}\n\n",
         meta.date,
         meta.version,
         meta.claude_version,
-        meta.model.unwrap_or("default"),
+        meta.model.map(String::from).unwrap_or_else(|| {
+            let mut seen: Vec<&str> = results
+                .iter()
+                .map(|r| r.model.as_str())
+                .filter(|m| !m.is_empty())
+                .collect();
+            seen.sort_unstable();
+            seen.dedup();
+            if seen.is_empty() {
+                "default".to_string()
+            } else {
+                format!("{} (Claude Code's default; pass --model to pin it)", seen.join(", "))
+            }
+        }),
         meta.tasks,
         meta.seed,
         runs(results),
@@ -735,6 +808,10 @@ fn render_md(meta: &Meta, results: &[RunResult]) -> String {
             Some(true) => "isolated (user settings and plugins left out)",
             Some(false) => "with the user's own settings and plugins (adds the same floor to every configuration)",
             None => "not recorded (before 0.1.7: the user's settings and plugins were loaded)",
+        },
+        match meta.interleaved {
+            Some(true) => "configurations interleaved per task (prompt-cache timing affects all equally)",
+            Some(false) | None => "one configuration after another (before 0.1.8; the later configurations ran with a warmer cache)",
         }
     );
     md.push_str(
@@ -847,6 +924,7 @@ pub fn rerender(json_path: &Path) -> Result<(PathBuf, String)> {
         tasks: v["tasks"].as_array().map_or(0, |t| t.len()),
         seed: v["seed"].as_u64().unwrap_or(0),
         isolated: v["isolated"].as_bool(),
+        interleaved: v["interleaved"].as_bool(),
     };
     let md = render_md(&meta, &results);
     let md_path = json_path.with_extension("md");
@@ -872,6 +950,7 @@ fn write_report(
             tasks: ts.tasks.len(),
             seed: ts.seed,
             isolated: Some(isolated),
+            interleaved: Some(true),
         },
         results,
     );
@@ -888,6 +967,7 @@ fn write_report(
             "model": model,
             "seed": ts.seed,
             "isolated": isolated,
+            "interleaved": true,
             "tasks": ts.tasks,
             "aggregates": agg,
             "results": results,
@@ -1004,6 +1084,7 @@ mod tests {
                 tasks: 1,
                 seed: 1,
                 isolated: Some(true),
+                interleaved: Some(true),
             },
             &results,
         );

@@ -13,6 +13,16 @@ use std::io::{BufRead, Write};
 const PROTOCOL: &str = "2025-06-18";
 
 fn tools() -> Value {
+    let mut tools = tool_defs();
+    for t in tools.as_array_mut().into_iter().flatten() {
+        // Claude Code defers MCP tools behind a ToolSearch turn unless told otherwise; five
+        // small tools are cheaper in the cached prefix than a search before every use.
+        t["_meta"] = json!({"anthropic/alwaysLoad": true});
+    }
+    tools
+}
+
+fn tool_defs() -> Value {
     json!([
         {
             "name": "brain_query",

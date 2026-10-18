@@ -4,6 +4,56 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- The per-prompt note now answers the prompt's "where" directly instead of guessing. Symbols
+  named in the prompt (`createSafeFetch`, `Parser.parse`, bare camelCase/snake_case words) are
+  resolved in the code graph to their definition (kind, file:lines, signature) and call sites;
+  files named in the prompt get their local description (images/PDFs) or summary and key
+  symbols; architecture questions get the repository map. Only prompts that name nothing fall
+  back to the ranked areas and files, now without multi-thousand-line plans and specs unless
+  the prompt is about documents. Measured on a 1,000-file monorepo, the note shrank from ~550
+  tokens of mostly irrelevant files (the right file third in the list) to ~120 tokens with the
+  answer; definitions shorter than 14 lines are quoted whole, so "where is X and what does it
+  do" needs no tool call at all. `prompt_context_tokens` defaults to 350.
+- The session brief is a third of its size: the overview keeps its first sentences (without the
+  small model's "Okay, here's an overview…" lead-in), at most four decisions and tasks, and no
+  tool pitch (the CLAUDE.md section has it). `brief_tokens` defaults to 350.
+- The CLAUDE.md section is shorter and tells Claude to trust the note, read code in ranges, and
+  use Read for images and PDFs (local-brain replaces them with the local description) instead
+  of `brain_doc`.
+- Images are only replaced by their local description when that is cheaper than the image
+  itself (a 200×200 fixture costs Claude ~50 tokens; its description more), and not when the
+  prompt's note already carried the description — then a Read is a request for the pixels and
+  returns them. The note gives an image's gist (300 characters) and a PDF's full text. The
+  replacement's preamble is one line. Previously image tasks paid for the description and then
+  for the image Claude fetched anyway; measured, a lone image is where a local model saves the
+  least (Claude reads one for ~50–1,600 tokens), PDFs and batches of screenshots are where it
+  pays.
+- Architecture questions get the module map with one line per top-level module.
+- The MCP server marks its tools always-loaded (`anthropic/alwaysLoad`), and `.mcp.json`
+  registrations set `alwaysLoad`. Claude Code otherwise defers MCP tools and needs a
+  `ToolSearch` turn before the first `brain_*` call — about 400 new tokens and a round trip
+  each time, which cost more than `brain_doc` saved.
+
+### Fixed
+- `bench` reset each worktree with `git clean` between tasks, which deleted graphify's untracked
+  index and CLAUDE.md after the first task: 17 of 18 "graphify" sessions were really vanilla,
+  and the comparison in 0.1.7's reports was wrong. Each configuration's setup is now committed
+  in its detached worktree, so resets keep it.
+- `bench` gave local-brain sessions the 0.1.4 hook layout (Read in PreToolUse, no
+  UserPromptSubmit) and an ad-hoc system-prompt line instead of the CLAUDE.md section. It now
+  installs exactly what `init` installs, from the same code.
+- `bench` ran one configuration after another; the later ones got a warmer prompt cache (about
+  2.4k more cached tokens per session on the second configuration). Configurations are now
+  interleaved per task; reports say which order was used.
+- `bench` reports name the model the sessions actually ran on. Without `--model` that is Claude
+  Code's default, which changes with `/model`; a run on a pricier default looked like a
+  regression.
+- `bench` sessions no longer write session summaries into the project's real memory (the memory
+  hooks are left out; they cost no tokens).
+
 ## [0.1.7] - 2026-10-18
 
 ### Added

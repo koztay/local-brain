@@ -242,51 +242,90 @@ pub fn archive_orphans(store: &Store, project: &Project) -> Result<usize> {
 }
 
 /// The session-start briefing (bounded by `budget` tokens).
+/// The first sentence or two of a model-written summary, without the chat filler small models
+/// add ("Okay, here's an overview of the project for a new contributor:").
+pub fn first_sentences(text: &str, max_chars: usize) -> String {
+    let flat = text.replace('\n', " ");
+    let mut t = flat.trim();
+    let lower = t.to_lowercase();
+    const FILLER: &[&str] = &[
+        "okay", "ok,", "ok.", "sure", "here's", "here is", "here’s", "certainly", "below is",
+        "alright", "great",
+    ];
+    if FILLER.iter().any(|f| lower.starts_with(f)) {
+        // Drop the lead-in: up to the first colon, or the first sentence, whichever is first.
+        let cut = t
+            .find(':')
+            .into_iter()
+            .chain(t.find(". "))
+            .min()
+            .map(|i| i + 1);
+        if let Some(i) = cut.filter(|i| *i < 160) {
+            t = t[i..].trim_start();
+        }
+    }
+    let mut out = String::new();
+    for sentence in t.split_inclusive(['.', '!', '?']) {
+        if !out.is_empty() && out.chars().count() + sentence.chars().count() > max_chars {
+            break;
+        }
+        out.push_str(sentence);
+        if out.chars().count() >= max_chars / 2 {
+            break;
+        }
+    }
+    util::clip(out.trim(), max_chars)
+}
+
+/// The session brief: what the project is, where it starts, and what was decided and left open
+/// — short, because every session pays for it before the first prompt. Tool usage is explained
+/// in the CLAUDE.md section, not repeated here.
 pub fn brief(store: &Store, project: &Project, budget: i64) -> Result<String> {
     let _ = sync_from_md(store, project);
     let mut out = String::from("[local-brain] Project brief\n");
     if let Some((s, stale, ..)) = store.summary("project", ".")? {
-        out.push_str(&format!(
-            "Overview{}: {}\n",
-            if stale { " (may be stale)" } else { "" },
-            util::clip(&s.replace('\n', " "), 500)
-        ));
+        let first = first_sentences(&s, 200);
+        if !first.is_empty() {
+            out.push_str(&format!(
+                "Overview{}: {}\n",
+                if stale { " (may be stale)" } else { "" },
+                first
+            ));
+        }
     }
     if let Some((a, ..)) = store.summary("architecture", ".")? {
-        let lines: Vec<&str> = a.lines().filter(|l| l.starts_with("Entry")).collect();
-        for l in lines {
-            out.push_str(&util::clip(l, 300));
+        for l in a.lines().filter(|l| l.starts_with("Entry")) {
+            out.push_str(&util::clip(l, 240));
             out.push('\n');
         }
     }
-    let decisions = list(store, Some("decision"), 6)?;
+    let decisions = list(store, Some("decision"), 4)?;
     if !decisions.is_empty() {
         out.push_str("Recent decisions:\n");
         for d in decisions {
             out.push_str(&format!(
                 "- {}{}\n",
-                util::clip(&d.text, 160),
+                util::clip(&d.text, 140),
                 d.why
-                    .map(|w| format!(" (why: {})", util::clip(&w, 100)))
+                    .map(|w| format!(" (why: {})", util::clip(&w, 90)))
                     .unwrap_or_default()
             ));
         }
     }
-    let todos = list(store, Some("todo"), 6)?;
+    let todos = list(store, Some("todo"), 4)?;
     if !todos.is_empty() {
         out.push_str("Open tasks:\n");
         for t in todos {
-            out.push_str(&format!("- [{}] {}\n", t.id, util::clip(&t.text, 160)));
+            out.push_str(&format!("- [{}] {}\n", t.id, util::clip(&t.text, 140)));
         }
     }
     if let Some(s) = list(store, Some("session"), 1)?.into_iter().next() {
         out.push_str(&format!(
             "Last session ({}): {}\n",
             util::fmt_ts(s.created),
-            util::clip(&s.text, 300)
+            util::clip(&s.text, 200)
         ));
     }
-    out.push_str("Use brain_query for questions about this codebase (answers with file:line pointers), brain_slice to fetch only the code you will edit, brain_doc for images/PDFs, brain_memory to record decisions.\n");
     Ok(util::clip_tokens(&out, budget).0)
 }
 
@@ -593,6 +632,17 @@ mod tests {
             decisions > 0,
             "sessions that change code still record decisions"
         );
+    }
+
+    #[test]
+    fn overview_drops_model_filler() {
+        let s = first_sentences(
+            "Okay, here's an overview of the `local-brain` project for a new contributor:  `local-brain` is a tool for coding agents. It indexes code locally. More text follows.",
+            120,
+        );
+        assert!(s.starts_with("`local-brain` is a tool"), "{s}");
+        assert!(!s.contains("More text"), "{s}");
+        assert_eq!(first_sentences("Plain summary.", 50), "Plain summary.");
     }
 
     #[test]

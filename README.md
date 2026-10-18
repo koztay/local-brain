@@ -241,12 +241,12 @@ before it continues. Hooks, the MCP server and the daemon never print it. Turn i
 
    | Event | Behavior |
    |---|---|
-   | `PostToolUse` Read on images/PDFs | Replaced by a local description (vision model / PDF text), in the project and outside it (e.g. a screenshot in `~/Desktop`). Claude gets the text; no image tokens. A small local model can misread exact text or numbers, so Claude can still fetch the original. Images pasted into the prompt go straight to Claude and cannot be intercepted. |
+   | `PostToolUse` Read on images/PDFs | Replaced by a local description (vision model / PDF text), in the project and outside it (e.g. a screenshot in `~/Desktop`), when that is cheaper than the image itself (a tiny icon is not) and unless the prompt's note already carried the description. Claude gets the text; no image tokens. A small local model can misread exact text or numbers, so Claude can still fetch the original (`offset: 1`). Images pasted into the prompt go straight to Claude and cannot be intercepted. |
    | `PostToolUse` Read on large files | Replaced by an outline (signatures + line ranges) with a pointer to `brain_slice` / `offset`+`limit`. |
    | `PreToolUse` Grep / Glob | When results exceed the threshold: ranked top results (definitions first, tests and generated files last) + `raw_id`. |
    | `PostToolUse` Bash | Long output is compressed (`updatedToolOutput`). Error/warning lines, stack traces, failing test names and exit codes are never removed. Read-like commands (`cat`, `git diff`, …) are left alone unless enormous. |
-   | `SessionStart` | A brief of ≤ ~500 tokens: overview, entry points, recent decisions, open tasks, last session. |
-   | `UserPromptSubmit` | For task prompts, a note of ≤ ~600 tokens on where the code lives: matching areas of the tree (e.g. `app/admin/` with its sections), the most relevant files with key symbols, then related docs. Confirmations and slash commands are skipped. |
+   | `SessionStart` | A brief of ≤ ~350 tokens: overview, entry points, recent decisions, open tasks, last session. |
+   | `UserPromptSubmit` | For task prompts, a note of ≤ ~350 tokens that answers "where": symbols named in the prompt (`createSafeFetch`, `Parser.parse`) resolved in the code graph to their definition (file:lines, signature) and call sites; files named in the prompt with their local description (images/PDFs) or summary and key symbols; the repository map for architecture questions; otherwise the matching areas of the tree (e.g. `app/admin/` with its sections) and the most relevant files. Confirmations, slash commands and Claude Code's own notifications are skipped. |
    | `Stop` / `SessionEnd` | The transcript is summarized locally into memory in the background (decisions, changed files, open tasks). |
 
    **Permissions:** Read is handled *after* Claude Code's permission check, so local-brain only
@@ -257,8 +257,9 @@ before it continues. Hooks, the MCP server and the daemon never print it. Turn i
    repeats the identical call. Hooks never break the agent: on any internal
    error they stay silent (logged to `~/.local-brain/logs/hooks.log`).
 3. **`CLAUDE.md`** gets a short, marked section asking Claude to use local-brain for every task:
-   start from the prompt's context note or `brain_query`, and read single symbols with
-   `brain_slice` instead of whole files.
+   trust the prompt's note and go straight to the code, read in ranges (`offset`/`limit` or
+   `brain_slice`) instead of whole files, ask `brain_query` for what the note does not answer,
+   and read images/PDFs with Read (local-brain replaces them with the local description).
 
 After an update, the next command you run refreshes these hooks and the `CLAUDE.md` section in
 every project, so new behaviour arrives without re-running `init`.
@@ -314,7 +315,7 @@ large_file_lines = 600         # Read of bigger files returns an outline first
 large_file_tokens = 8000
 grep_max_results = 80          # Grep results above this are ranked and trimmed
 glob_max_results = 200
-brief_tokens = 500
+brief_tokens = 350
 
 [index]
 exclude = ["generated/", "*.snap"]   # never indexed (plus .gitignore, secrets, vendored dirs)
@@ -346,10 +347,13 @@ See [docs/configuration.md](docs/configuration.md) for every option.
 * **`local-brain bench`:** derives 20 reproducible tasks from your project (seeded; editable in
   `.local-brain/bench/tasks.json`): "where is X defined", "who calls Y", architecture, document
   and test-suite tasks. Each configuration runs headless (`claude -p`) in its own disposable git
-  worktree and is scored on total session tokens (input, output, cache read, cache write), tool
-  calls, time, cost and task success. Pass `--graphify-setup "<command>"` with the command that
-  installs graphify into a repository to include the graphify configuration. Reports are written
-  as Markdown and JSON with seed and version information.
+  worktree and is scored on cost, new tokens (uncached input + cache writes), tool calls, time
+  and task success. Configurations are interleaved per task so prompt-cache timing favours none
+  of them, and the local-brain configuration gets exactly what `init` installs. Pass
+  `--graphify-setup "<command>"` with the command that installs graphify into a repository to
+  include the graphify configuration, and `--model` to pin the model (otherwise Claude Code's
+  default is used and named in the report). Reports are written as Markdown and JSON with seed
+  and version information.
 
 ## Project status
 

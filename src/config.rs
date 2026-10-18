@@ -191,8 +191,8 @@ impl Default for HooksCfg {
             grep_max_results: 80,
             grep_show: 30,
             glob_max_results: 200,
-            brief_tokens: 500,
-            prompt_context_tokens: 600,
+            brief_tokens: 350,
+            prompt_context_tokens: 350,
         }
     }
 }

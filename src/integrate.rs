@@ -37,18 +37,60 @@ const MD_END: &str = "<!-- local-brain:end -->";
 const CLAUDE_MD_SECTION: &str = "<!-- local-brain:start -->
 ## local-brain (local project brain)
 
-This project is indexed by local-brain, a local index of this codebase that costs no cloud
-tokens. Use it for every task (features, fixes, refactors, reviews), not only for questions:
-- Prompts may arrive with a \"local-brain context\" note listing the most relevant files. Start there.
-- To locate code for a task, ask `brain_query` (e.g. \"admin panel pages and their layout components\")
-  before exploring with Glob/Grep/Read.
-- Read only what you need with `brain_slice` (one symbol or a line range). Read a whole file only
-  when you are about to change most of it.
-- Image and PDF files are read locally: use `brain_doc` (or Read, which local-brain intercepts).
-- Long command outputs are compressed; get the full text with `brain_raw` and the given `raw_id`.
-- Record important technical decisions with `brain_memory` (action `note`).
+This project is indexed by local-brain (a local code index, no cloud tokens). Use it for every task:
+- Task prompts come with a `local-brain` note: the named symbols' definitions and call sites
+  (file:lines, often the code itself) or the files where the work belongs. Trust it; go there
+  directly instead of searching.
+- Read code in ranges (Read `offset`/`limit`, or `brain_slice` for one symbol), whole files only
+  to rewrite them. Ask `brain_query` for what the note does not answer (how does X work).
+- Images/PDFs: use Read; local-brain returns a local description. Long command outputs are
+  compressed (`brain_raw` + `raw_id` for the full text). Record decisions with `brain_memory`.
 <!-- local-brain:end -->
 ";
+
+/// Add or refresh the local-brain section in `<root>/CLAUDE.md`. Returns true when the file
+/// changed.
+pub fn ensure_claude_md_section(root: &Path) -> Result<bool> {
+    let md = root.join("CLAUDE.md");
+    let cur = std::fs::read_to_string(&md).unwrap_or_default();
+    let new = match (cur.find(MD_START), cur.find(MD_END)) {
+        (Some(a), Some(b)) if b > a => format!(
+            "{}{}{}",
+            &cur[..a],
+            CLAUDE_MD_SECTION.trim_end(),
+            &cur[b + MD_END.len()..]
+        ),
+        _ => {
+            let mut c = cur.clone();
+            if !c.is_empty() && !c.ends_with("\n\n") {
+                c.push_str(if c.ends_with('\n') { "\n" } else { "\n\n" });
+            }
+            c.push_str(CLAUDE_MD_SECTION);
+            c
+        }
+    };
+    if new == cur {
+        return Ok(false);
+    }
+    std::fs::write(&md, new).with_context(|| format!("writing {}", md.display()))?;
+    Ok(true)
+}
+
+/// The hooks this version installs, as a Claude Code settings object (`{"hooks": {...}}`) —
+/// what `install` writes, and what `bench` gives its local-brain sessions.
+pub fn hooks_settings(exe: &str) -> Value {
+    let mut hooks = serde_json::Map::new();
+    for (event, entry) in our_hooks(exe) {
+        if let Some(a) = hooks
+            .entry(event)
+            .or_insert_with(|| Value::Array(vec![]))
+            .as_array_mut()
+        {
+            a.push(entry);
+        }
+    }
+    json!({ "hooks": hooks })
+}
 
 fn read_json(p: &Path) -> Result<Value> {
     match std::fs::read_to_string(p) {
@@ -265,7 +307,8 @@ impl ClaudeCode {
         }
         let p = project.root.join(".mcp.json");
         let mut v = read_json(&p)?;
-        v["mcpServers"][MCP_NAME] = json!({"type": "stdio", "command": exe, "args": ["mcp"]});
+        v["mcpServers"][MCP_NAME] =
+            json!({"type": "stdio", "command": exe, "args": ["mcp"], "alwaysLoad": true});
         write_json(&p, &v)?;
         // Pre-approve the project server so Claude Code does not prompt.
         let sp = Self::settings_path(project);
@@ -353,26 +396,7 @@ impl Agent for ClaudeCode {
             done.push("added .claude/settings.local.json to .gitignore".into());
         }
 
-        let md = project.root.join("CLAUDE.md");
-        let cur = std::fs::read_to_string(&md).unwrap_or_default();
-        let new = match (cur.find(MD_START), cur.find(MD_END)) {
-            (Some(a), Some(b)) if b > a => format!(
-                "{}{}{}",
-                &cur[..a],
-                CLAUDE_MD_SECTION.trim_end(),
-                &cur[b + MD_END.len()..]
-            ),
-            _ => {
-                let mut c = cur.clone();
-                if !c.is_empty() && !c.ends_with("\n\n") {
-                    c.push_str(if c.ends_with('\n') { "\n" } else { "\n\n" });
-                }
-                c.push_str(CLAUDE_MD_SECTION);
-                c
-            }
-        };
-        if new != cur {
-            std::fs::write(&md, new)?;
+        if ensure_claude_md_section(&project.root)? {
             done.push("added the local-brain section to CLAUDE.md".into());
         }
         Ok(done)
