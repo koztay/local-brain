@@ -86,7 +86,7 @@ pub fn handle(event: &str, v: &Value) -> Result<Option<Value>> {
             pre_glob(&project, &cfg, &store, &session, input, v)
         }
         ("post-tool-use", "Bash") if cfg.hooks.bash => {
-            post_bash(&project, &cfg, &store, &session, input, &v["tool_response"])
+            post_bash(&project, &cfg, &store, &session, input, v)
         }
         ("post-tool-use", "Read") => {
             post_read(&project, &cfg, &store, &session, input, &v["tool_response"])
@@ -654,15 +654,382 @@ fn bash_factor(cmd: &str) -> i64 {
     }
 }
 
+// ---- Bash reads ------------------------------------------------------------------------------
+//
+// Claude often reads and searches through Bash (`cat`, `grep -rn`) instead of Read and Grep, and
+// in bypass-permissions mode Claude Code tells it to. These get the same treatment as the tools:
+// a large file is replaced by its outline, an oversized recursive search is ranked and trimmed.
+// Narrow reads (`sed -n`, `head`, piped output) pass through, and repeating the identical command
+// within the retry window returns the original.
+
+/// Shell words of one simple command: whitespace-separated, quotes and backslash escapes removed.
+fn shell_words(seg: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = seg.chars();
+    let mut started = false;
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('"'), '\\') => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            (Some(_), c) => cur.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                started = true;
+            }
+            (None, '\\') => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                    started = true;
+                }
+            }
+            (None, c) if c.is_whitespace() => {
+                if started || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            (None, c) => {
+                cur.push(c);
+                started = true;
+            }
+        }
+    }
+    if started || !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// The simple commands of a command line (split on `;`, `&&`, `||` and newlines). Returns None
+/// when the line uses constructs whose output we cannot attribute (subshells, redirections into
+/// the output, loops).
+fn simple_commands(cmd: &str) -> Option<Vec<String>> {
+    if cmd.contains("$(") || cmd.contains('`') || cmd.contains("<(") {
+        return None;
+    }
+    let mut segs = Vec::new();
+    for line in cmd.lines() {
+        for a in line.split("&&") {
+            for b in a.split("||") {
+                for c in b.split(';') {
+                    let t = c.trim();
+                    if !t.is_empty() {
+                        segs.push(t.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if segs.iter().any(|s| {
+        let w = s.split_whitespace().next().unwrap_or("");
+        matches!(
+            w,
+            "for" | "while" | "do" | "done" | "if" | "then" | "fi" | "case"
+        )
+    }) {
+        return None;
+    }
+    Some(segs)
+}
+
+/// Files a `cat` prints whole: `cat a.ts b.ts` without a pipe. Paths resolved against `cwd`.
+fn cat_files(cmd: &str, cwd: &Path) -> Vec<PathBuf> {
+    let Some(segs) = simple_commands(cmd) else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    for seg in segs {
+        if seg.contains('|') || seg.contains('>') {
+            continue;
+        }
+        let words = shell_words(&seg);
+        if words.first().map(|w| w != "cat").unwrap_or(true) {
+            continue;
+        }
+        for w in &words[1..] {
+            if w.starts_with('-') || w.contains('*') || w.contains('?') {
+                continue;
+            }
+            let p = if Path::new(w).is_absolute() {
+                PathBuf::from(w)
+            } else {
+                cwd.join(w)
+            };
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// A whole-file `cat` of large project files: each such file's text in the output is replaced
+/// by its outline (the same rule and limits as a Read). Returns the new output.
+fn bash_cat_outline(
+    project: &Project,
+    cfg: &Config,
+    store: &Store,
+    session: &str,
+    cmd: &str,
+    cwd: &Path,
+    stdout: &str,
+) -> Result<Option<String>> {
+    let files = cat_files(cmd, cwd);
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let mut out = stdout.to_string();
+    let mut before = 0;
+    let mut after = 0;
+    for abs in files {
+        if !inside_project(project, &abs) {
+            continue;
+        }
+        let Some(text) = util::read_text(&abs) else {
+            continue;
+        };
+        let lines = text.lines().count();
+        let toks = util::tokens(&text);
+        if lines <= cfg.hooks.large_file_lines && toks <= cfg.hooks.large_file_tokens {
+            continue;
+        }
+        let Some(at) = out.find(text.as_str()) else {
+            continue;
+        };
+        let rel = project.rel(&abs);
+        let skel = crate::slice::skeleton(store, project, &rel)?;
+        let (skel, _) = util::clip_tokens(&skel, 2500);
+        let note = format!(
+            "[local-brain] {} is large ({} lines, ~{} tokens); its outline is below. Read the part \
+             you need with `sed -n 'START,ENDp' {}` (or brain_slice); run the identical command \
+             again for the full text.\n{}\n",
+            rel,
+            lines,
+            util::human_tokens(toks),
+            rel,
+            skel.trim_end()
+        );
+        before += toks;
+        after += util::tokens(&note);
+        out.replace_range(at..at + text.len(), &note);
+    }
+    if after == 0 || after >= before {
+        return Ok(None);
+    }
+    store.record_metric("hook", "bash_cat", before, after, Some(session))?;
+    Ok(Some(out))
+}
+
+/// `grep -rn …`, `rg …`, `git grep …` as the only command (pipes into another grep are fine).
+fn is_search_command(cmd: &str) -> bool {
+    let Some(segs) = simple_commands(cmd) else {
+        return false;
+    };
+    if segs.len() != 1 {
+        return false;
+    }
+    let first = before_pipe(&segs[0]).trim().to_string();
+    let words = shell_words(&first);
+    match words.first().map(String::as_str) {
+        Some("rg") => true,
+        Some("git") => words.get(1).map(|w| w == "grep").unwrap_or(false),
+        Some("grep" | "egrep" | "fgrep") => {
+            words.iter().any(|w| {
+                w.starts_with('-') && !w.starts_with("--") && (w.contains('r') || w.contains('R'))
+            }) || words.iter().any(|w| w == "--recursive")
+        }
+        _ => false,
+    }
+}
+
+/// The first command of a pipeline: everything before the first `|` outside quotes.
+fn before_pipe(cmd: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in cmd.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match (quote, c) {
+            (_, '\\') if quote != Some('\'') => escaped = true,
+            (Some(q), c) if c == q => quote = None,
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '|') => return &cmd[..i],
+            _ => {}
+        }
+    }
+    cmd
+}
+
+/// The pattern of a search command: the `-e` value, or the first word that is not an option.
+/// grep's basic-regex `\|` alternation is turned into `|`.
+fn search_pattern(cmd: &str) -> Option<String> {
+    let first = before_pipe(cmd);
+    let words = shell_words(first);
+    let skip = if words.first().map(|w| w == "git").unwrap_or(false) {
+        2
+    } else {
+        1
+    };
+    let mut it = words.iter().skip(skip);
+    while let Some(w) = it.next() {
+        if w == "-e" || w == "--regexp" || w == "--" {
+            return it.next().map(|p| p.replace("\\|", "|"));
+        }
+        if w.starts_with('-') {
+            // Options that take a value.
+            if matches!(
+                w.as_str(),
+                "-A" | "-B"
+                    | "-C"
+                    | "-m"
+                    | "-g"
+                    | "-t"
+                    | "--include"
+                    | "--exclude"
+                    | "--glob"
+                    | "--type"
+            ) {
+                it.next();
+            }
+            continue;
+        }
+        return Some(w.replace("\\|", "|"));
+    }
+    None
+}
+
+/// An oversized recursive search: ranked with the code graph (definitions first, tests and
+/// generated files last) and trimmed like a Grep call; the full output goes to brain_raw.
+fn bash_search_trim(
+    project: &Project,
+    cfg: &Config,
+    store: &Store,
+    session: &str,
+    cmd: &str,
+    cwd: &Path,
+    stdout: &str,
+) -> Result<Option<String>> {
+    if !is_search_command(cmd) {
+        return Ok(None);
+    }
+    use std::sync::OnceLock;
+    static LINE: OnceLock<Regex> = OnceLock::new();
+    let line_re = LINE.get_or_init(|| Regex::new(r"^([^:\n]+?)[:-](\d+)[:-](.*)$").unwrap());
+    let all: Vec<&str> = stdout.lines().collect();
+    if all.len() <= cfg.hooks.grep_max_results {
+        return Ok(None);
+    }
+    let mut hits: Vec<Hit> = Vec::new();
+    let mut other = 0;
+    for l in &all {
+        let Some(c) = line_re.captures(l) else {
+            other += 1;
+            continue;
+        };
+        let path = c[1].to_string();
+        let n: usize = c[2].parse().unwrap_or(0);
+        let abs = if Path::new(&path).is_absolute() {
+            PathBuf::from(&path)
+        } else {
+            cwd.join(&path)
+        };
+        let rel = project.rel(&abs);
+        match hits.iter_mut().find(|h| h.rel == rel) {
+            Some(h) => {
+                h.lines.push((n, c[3].to_string()));
+                h.count += 1;
+            }
+            None => hits.push(Hit {
+                rel,
+                lines: vec![(n, c[3].to_string())],
+                count: 1,
+            }),
+        }
+    }
+    // Only output that is mostly `path:line:text` is a search result we can rank.
+    if hits.is_empty() || other * 5 > all.len() {
+        return Ok(None);
+    }
+    let pattern =
+        search_pattern(cmd).and_then(|p| RegexBuilder::new(&p).case_insensitive(true).build().ok());
+    rank_hits(store, pattern.as_ref(), &mut hits);
+    let raw_id = crate::raw::save(
+        Some(project),
+        &crate::secrets::mask(stdout),
+        cfg.compress.raw_ttl_days,
+    )?;
+    let mut shown = Vec::new();
+    'outer: for h in &hits {
+        for (n, l) in h.lines.iter().take(4) {
+            if shown.len() >= cfg.hooks.grep_show {
+                break 'outer;
+            }
+            shown.push(format!("{}:{}:{}", h.rel, n, util::clip(l.trim_end(), 220)));
+        }
+    }
+    let out = format!(
+        "[local-brain] {} matching lines in {} files (~{} tokens). The most relevant are below \
+         (ranked with the code graph: definitions first, tests and generated files last). Full \
+         output: brain_raw(raw_id=\"{}\", grep=…), or run the identical command again.\n{}\n",
+        all.len() - other,
+        hits.len(),
+        util::human_tokens(util::tokens(stdout)),
+        raw_id,
+        crate::secrets::mask(&shown.join("\n"))
+    );
+    store.record_metric(
+        "hook",
+        "bash_grep",
+        util::tokens(stdout),
+        util::tokens(&out),
+        Some(session),
+    )?;
+    Ok(Some(out))
+}
+
 fn post_bash(
     project: &Project,
     cfg: &Config,
     store: &Store,
     session: &str,
     input: &Value,
-    resp: &Value,
+    v: &Value,
 ) -> Result<Option<Value>> {
+    let resp = &v["tool_response"];
     let cmd = input["command"].as_str().unwrap_or("");
+    // Reads and searches through Bash, like Read and Grep.
+    if let Some(stdout) = resp["stdout"].as_str() {
+        let cwd = v["cwd"]
+            .as_str()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| project.root.clone());
+        let key = format!("bash:{}", util::sha256_hex(cmd.as_bytes()));
+        if !escape(store, session, &key)? {
+            let mut replaced = None;
+            if cfg.hooks.read_large {
+                replaced = bash_cat_outline(project, cfg, store, session, cmd, &cwd, stdout)?;
+            }
+            if replaced.is_none() && cfg.hooks.grep {
+                replaced = bash_search_trim(project, cfg, store, session, cmd, &cwd, stdout)?;
+            }
+            if let Some(new_out) = replaced {
+                store.record_denial(session, &key)?;
+                let mut new = resp.as_object().cloned().unwrap_or_default();
+                new.insert("stdout".into(), Value::String(new_out));
+                return Ok(Some(json!({"hookSpecificOutput": {
+                    "hookEventName": "PostToolUse", "updatedToolOutput": Value::Object(new)
+                }})));
+            }
+        } else {
+            return Ok(None);
+        }
+    }
     let factor = bash_factor(cmd);
     let mut c = cfg.clone();
     c.compress.threshold_tokens = cfg.compress.threshold_tokens.saturating_mul(factor);
@@ -1667,6 +2034,77 @@ mod tests {
         assert!(!inside_project(&p, &root.join("link/passport.pdf")));
         assert!(!inside_project(&p, &root.join("../secret/passport.pdf")));
         assert!(!inside_project(&p, &outside.join("passport.pdf")));
+    }
+
+    #[test]
+    fn bash_reads_are_recognised() {
+        assert_eq!(
+            shell_words(r#"cat 'a b.ts' app/\[locale\]/page.tsx "x y""#),
+            vec!["cat", "a b.ts", "app/[locale]/page.tsx", "x y"]
+        );
+        let cwd = Path::new("/p");
+        assert_eq!(
+            cat_files("cat src/a.ts src/b.ts; grep -n x src/c.ts", cwd),
+            vec![PathBuf::from("/p/src/a.ts"), PathBuf::from("/p/src/b.ts")]
+        );
+        assert!(
+            cat_files("cat src/a.ts | head -50", cwd).is_empty(),
+            "piped: already narrow"
+        );
+        assert!(cat_files("sed -n 1,80p src/a.ts", cwd).is_empty());
+        assert!(cat_files("for f in *.ts; do cat $f; done", cwd).is_empty());
+        assert!(is_search_command("grep -rn \"listMyRsvps\" apps packages"));
+        assert!(is_search_command("rg -n createSafeFetch | grep -v test"));
+        assert!(is_search_command("git grep -n rateHit"));
+        assert!(
+            !is_search_command("grep -n x src/a.ts"),
+            "one file is a narrow read"
+        );
+        assert!(
+            !is_search_command("ls; grep -rn x ."),
+            "mixed output is left alone"
+        );
+        assert_eq!(
+            search_pattern("grep -rn -A 3 'admin\\|yonetim' docs").as_deref(),
+            Some("admin|yonetim")
+        );
+        assert_eq!(search_pattern("rg -e foo src").as_deref(), Some("foo"));
+        assert_eq!(
+            search_pattern("git grep -n rateHit").as_deref(),
+            Some("rateHit")
+        );
+    }
+
+    #[test]
+    fn large_cat_becomes_an_outline_and_repeats_get_the_original() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let big: String = (0..900).map(|i| format!("const v{i} = {i};\n")).collect();
+        std::fs::write(root.join("src/big.ts"), &big).unwrap();
+        std::fs::write(root.join("src/small.ts"), "export const a = 1;\n").unwrap();
+        let project = Project::new(root.clone());
+        let store = Store::open(&project).unwrap();
+        let cfg = Config::default();
+        let stdout = format!("{}export const a = 1;\n", big);
+        let v = json!({"cwd": root, "tool_response": {"stdout": stdout, "stderr": ""}});
+        let input = json!({"command": "cat src/big.ts src/small.ts"});
+        let out = post_bash(&project, &cfg, &store, "s", &input, &v)
+            .unwrap()
+            .unwrap();
+        let text = out["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .unwrap();
+        assert!(text.contains("src/big.ts is large (900 lines"), "{text}");
+        assert!(
+            text.contains("export const a = 1;"),
+            "small files stay whole"
+        );
+        assert!(text.len() < stdout.len() / 4);
+        // The identical command again returns the original.
+        assert!(post_bash(&project, &cfg, &store, "s", &input, &v)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

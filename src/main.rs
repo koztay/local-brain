@@ -172,6 +172,10 @@ enum Cmd {
         /// Save every session's full stream-json transcript under .local-brain/bench/transcripts/
         #[arg(long)]
         keep_transcripts: bool,
+        /// Claude Code permission mode for the sessions, e.g. bypassPermissions (Claude then
+        /// reads and searches through Bash)
+        #[arg(long)]
+        permission_mode: Option<String>,
     },
     /// Check runtime, models, hooks and MCP; optionally switch the runtime provider
     Doctor {
@@ -493,6 +497,7 @@ fn real_main(cli: Cli) -> Result<i32> {
             repeat,
             with_user_settings,
             keep_transcripts,
+            permission_mode,
         } => {
             if let Some(json) = report {
                 let (path, md) = bench::rerender(&json)?;
@@ -537,6 +542,7 @@ fn real_main(cli: Cli) -> Result<i32> {
                     repeat,
                     isolate: !with_user_settings,
                     keep_transcripts,
+                    permission_mode,
                 };
                 eprintln!("Running real Claude Code sessions in disposable worktrees (this uses your Claude plan/API credits).");
                 let (path, md) = bench::run(&p, &cfg, &ts, &opts)?;

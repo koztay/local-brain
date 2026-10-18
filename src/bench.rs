@@ -403,6 +403,7 @@ fn run_claude(
     mcp_config: &Value,
     settings: Option<&Value>,
     model: Option<&str>,
+    permission_mode: Option<&str>,
     max_turns: u32,
     timeout_s: u64,
     isolate: bool,
@@ -435,6 +436,10 @@ fn run_claude(
     }
     if let Some(s) = settings {
         cmd.args(["--settings", &s.to_string()]);
+    }
+    if let Some(pm) = permission_mode {
+        // e.g. bypassPermissions: Claude Code then steers Claude to Bash for reads and searches.
+        cmd.args(["--permission-mode", pm]);
     }
     if let Some(m) = model {
         cmd.args(["--model", m]);
@@ -548,6 +553,8 @@ pub struct RunOptions {
     pub isolate: bool,
     /// Save each session's stream-json under `.local-brain/bench/transcripts/<run>/`.
     pub keep_transcripts: bool,
+    /// Claude Code permission mode for the sessions (`bypassPermissions`, `acceptEdits`, …).
+    pub permission_mode: Option<String>,
 }
 
 /// Run the comparison with real Claude Code sessions.
@@ -684,6 +691,7 @@ pub fn run(
                     &s.mcp,
                     s.settings.as_ref(),
                     opts.model.as_deref(),
+                    opts.permission_mode.as_deref(),
                     opts.max_turns,
                     opts.timeout_s,
                     opts.isolate,
@@ -718,6 +726,7 @@ pub fn run(
         &claude_version,
         opts.model.as_deref(),
         opts.isolate,
+        opts.permission_mode.as_deref(),
     )
 }
 
@@ -746,6 +755,7 @@ struct Meta<'a> {
     isolated: Option<bool>,
     /// Whether configurations were interleaved per task (None: older report, sequential).
     interleaved: Option<bool>,
+    permission_mode: Option<&'a str>,
 }
 
 fn aggregate(results: &[RunResult]) -> BTreeMap<String, Agg> {
@@ -783,7 +793,7 @@ fn render_md(meta: &Meta, results: &[RunResult]) -> String {
     let agg = aggregate(results);
     let total = |a: &Agg| a.input + a.output + a.cache_read + a.cache_write;
     let mut md = format!(
-        "# local-brain bench report\n\n- Date: {}\n- local-brain: {}\n- Claude Code: {}\n- Model: {}\n- Task set: {} tasks, seed {}, {} run(s) each\n- Sessions: {}\n- Order: {}\n\n",
+        "# local-brain bench report\n\n- Date: {}\n- local-brain: {}\n- Claude Code: {}\n- Model: {}\n- Task set: {} tasks, seed {}, {} run(s) each\n- Sessions: {}{}\n- Order: {}\n\n",
         meta.date,
         meta.version,
         meta.claude_version,
@@ -809,6 +819,9 @@ fn render_md(meta: &Meta, results: &[RunResult]) -> String {
             Some(false) => "with the user's own settings and plugins (adds the same floor to every configuration)",
             None => "not recorded (before 0.1.7: the user's settings and plugins were loaded)",
         },
+        meta.permission_mode
+            .map(|m| format!(", permission mode {}", m))
+            .unwrap_or_default(),
         match meta.interleaved {
             Some(true) => "configurations interleaved per task (prompt-cache timing affects all equally)",
             Some(false) | None => "one configuration after another (before 0.1.8; the later configurations ran with a warmer cache)",
@@ -925,6 +938,7 @@ pub fn rerender(json_path: &Path) -> Result<(PathBuf, String)> {
         seed: v["seed"].as_u64().unwrap_or(0),
         isolated: v["isolated"].as_bool(),
         interleaved: v["interleaved"].as_bool(),
+        permission_mode: v["permission_mode"].as_str(),
     };
     let md = render_md(&meta, &results);
     let md_path = json_path.with_extension("md");
@@ -939,6 +953,7 @@ fn write_report(
     claude_version: &str,
     model: Option<&str>,
     isolated: bool,
+    permission_mode: Option<&str>,
 ) -> Result<(PathBuf, String)> {
     let agg = aggregate(results);
     let md = render_md(
@@ -951,6 +966,7 @@ fn write_report(
             seed: ts.seed,
             isolated: Some(isolated),
             interleaved: Some(true),
+            permission_mode,
         },
         results,
     );
@@ -968,6 +984,7 @@ fn write_report(
             "seed": ts.seed,
             "isolated": isolated,
             "interleaved": true,
+            "permission_mode": permission_mode,
             "tasks": ts.tasks,
             "aggregates": agg,
             "results": results,
@@ -1085,6 +1102,7 @@ mod tests {
                 seed: 1,
                 isolated: Some(true),
                 interleaved: Some(true),
+                permission_mode: None,
             },
             &results,
         );

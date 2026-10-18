@@ -572,7 +572,7 @@ pub fn summarize_all(
                 }
             }
         }
-        store.put_summary("module", key, &text, &h, false, &model)?;
+        keep_or_put(store, "module", key, &text, &h, &model)?;
         written += 1;
     }
 
@@ -633,7 +633,7 @@ pub fn summarize_all(
                 }
             }
         }
-        store.put_summary("project", ".", &text, &arch_hash, false, &model)?;
+        keep_or_put(store, "project", ".", &text, &arch_hash, &model)?;
         written += 1;
     }
     Ok(SummaryStats {
@@ -959,9 +959,67 @@ pub fn architecture_map(store: &Store, project: &Project, files: &[FileRow]) -> 
     Ok(out)
 }
 
+/// Store a refreshed summary — unless it is only the rule-based fallback (the model was busy,
+/// out of budget, or unloaded under memory pressure) and a model-written one exists: then the
+/// model's text is kept, marked stale under its old hash so the next pass retries. A downgrade
+/// would put a file list into every session brief until the model gets to it.
+fn keep_or_put(
+    store: &Store,
+    scope: &str,
+    key: &str,
+    text: &str,
+    hash: &str,
+    model: &str,
+) -> Result<()> {
+    if model == "rules" {
+        let old_model = store.summary_model(scope, key).ok().flatten();
+        if old_model.is_some_and(|m| m != "rules") {
+            // The old hash stays, so the next pass sees the change and retries with the model.
+            return store.mark_stale(scope, key);
+        }
+    }
+    store.put_summary(scope, key, text, hash, false, model)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_model_summary_is_not_downgraded_to_rules() {
+        let d = tempfile::tempdir().unwrap();
+        let project = Project::new(d.path().to_path_buf());
+        let store = Store::open(&project).unwrap();
+        store
+            .put_summary(
+                "project",
+                ".",
+                "Takvim is an event calendar.",
+                "h1",
+                false,
+                "gemma3:4b",
+            )
+            .unwrap();
+        keep_or_put(
+            &store,
+            "project",
+            ".",
+            "1048 files (935 code)",
+            "h2",
+            "rules",
+        )
+        .unwrap();
+        let (text, stale, _, hash) = store.summary("project", ".").unwrap().unwrap();
+        assert_eq!(text, "Takvim is an event calendar.");
+        assert!(stale, "marked stale so the brief says so");
+        assert_eq!(hash, "h1", "old hash kept, so the next pass retries");
+        // A model result replaces it as usual.
+        keep_or_put(&store, "project", ".", "New overview.", "h2", "gemma3:4b").unwrap();
+        assert_eq!(
+            store.summary("project", ".").unwrap().unwrap().0,
+            "New overview."
+        );
+    }
 
     #[test]
     fn rejects_non_prose() {

@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- Reads and searches through Bash get the same treatment as Read and Grep. Claude often uses
+  `cat` and `grep -rn` instead of the tools, and in bypass-permissions mode Claude Code tells it
+  to, so local-brain's savings never applied there. A `cat` of a large project file (the
+  `large_file_lines`/`large_file_tokens` limits) is replaced by the file's outline; an oversized
+  recursive `grep`/`rg`/`git grep` is ranked with the code graph (the definition first) and
+  trimmed to `grep_show` lines, with the full output in `brain_raw`. Narrow reads (`sed -n`,
+  `head`, piped output) pass through, and running the identical command again returns the
+  original. Measured on takvim.in: `cat` of the 2,416-line database types went from ~17k tokens
+  to ~290.
+- `bench --permission-mode <mode>` runs the sessions in that Claude Code permission mode (e.g.
+  `bypassPermissions`), to measure the configuration you actually work in.
+
+### Fixed
+- When the local model was busy or unloaded under memory pressure, a background refresh replaced
+  model-written project and module summaries with the rule-based fallback (a file list), which
+  then opened every session brief. The model's text is now kept, marked stale, and retried on
+  the next pass.
+
 ## [0.1.9] - 2026-10-18
 
 ### Fixed
