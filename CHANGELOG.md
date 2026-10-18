@@ -19,6 +19,15 @@ All notable changes to this project are documented here. The format follows
 - `bench --permission-mode <mode>` runs the sessions in that Claude Code permission mode (e.g.
   `bypassPermissions`), to measure the configuration you actually work in.
 
+- The per-prompt note's fallback (prompts that name no symbol or file) no longer lists
+  directories the prompt itself names ("in apps/ and services/") or files that share no
+  specific word with the prompt; when nothing specific remains there is no note.
+- `bench --repeat` marks repeated runs ("(run 2 of 2)"): an identical prompt replayed the
+  identical first request, which the API served from cache for free, so repeats measured
+  caching rather than the configuration — and penalised whichever configuration's context
+  had changed in between. Reports also name each configuration's first-session cost, which
+  includes writing its prompt prefix to the cache.
+
 ### Fixed
 - When the local model was busy or unloaded under memory pressure, a background refresh replaced
   model-written project and module summaries with the rule-based fallback (a file list), which

@@ -1786,7 +1786,27 @@ fn prompt_context(
     c.runtime.timeout_secs = c.runtime.timeout_secs.min(8);
     let q = util::clip(prompt, 2000);
     let hits = crate::query::search(store, &c, &q, None, &[], 40)?;
-    let areas = matching_areas(store, &place_terms(&q))?;
+    let terms = place_terms(&q);
+    let lower_prompt = q.to_lowercase();
+    // Areas the prompt already names as paths ("in apps/ and services/") tell Claude nothing.
+    let areas: Vec<Area> = matching_areas(store, &terms)?
+        .into_iter()
+        .filter(|a| {
+            let last = a.dir.rsplit('/').next().unwrap_or(&a.dir).to_lowercase();
+            !lower_prompt.contains(&format!("{}/", last))
+        })
+        .collect();
+    // A file is worth naming only when it shares a specific word with the prompt; lexical
+    // search otherwise surfaces whatever shares common vocabulary ("page", "service").
+    let strong: Vec<&String> = terms
+        .iter()
+        .filter(|t| t.chars().count() >= 5 && !lower_prompt.contains(&format!("{}/", t)))
+        .collect();
+    let relevant = |path: &str, summary: &str| -> bool {
+        let hay = format!("{} {}", path, summary).to_lowercase();
+        hay.split(|c: char| !c.is_alphanumeric())
+            .any(|w| strong.iter().any(|t| w == t.as_str()))
+    };
     if hits.is_empty() && areas.is_empty() {
         return Ok(None);
     }
@@ -1886,6 +1906,9 @@ fn prompt_context(
             break;
         }
         let line = file_line(path)?;
+        if !relevant(path, &line) {
+            continue;
+        }
         if !fits(&out, &line) {
             break;
         }
@@ -1895,6 +1918,9 @@ fn prompt_context(
     // Inside a matching area, the best few files are still worth naming.
     for path in code.iter().filter(|p| in_area(p)).take(3) {
         let line = file_line(path)?;
+        if !relevant(path, &line) {
+            continue;
+        }
         if !fits(&out, &line) {
             break;
         }

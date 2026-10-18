@@ -684,6 +684,19 @@ pub fn run(
                     t.id,
                     s.config
                 );
+                // Repeats carry a run marker: an identical prompt would replay the identical
+                // first request, which the API serves from cache for free, so a repeat without
+                // it measures caching, not the configuration.
+                let marked;
+                let t: &Task = if run == 0 {
+                    t
+                } else {
+                    marked = Task {
+                        prompt: format!("{}\n\n(run {} of {})", t.prompt, run + 1, repeat),
+                        ..(*t).clone()
+                    };
+                    &marked
+                };
                 let mut r = run_claude(
                     t,
                     &s.config,
@@ -874,6 +887,22 @@ fn render_md(meta: &Meta, results: &[RunResult]) -> String {
             s.tasks,
             b.successes,
             b.tasks
+        ));
+    }
+    // The first session of a configuration also writes its prompt prefix (tools, system prompt)
+    // to the cache — once per hour of inactivity in real use, but in a short run it is a large
+    // share of the total and differs between configurations with different tool lists.
+    let mut firsts: Vec<String> = Vec::new();
+    for (c, _) in &ranked {
+        if let Some(r) = results.iter().find(|r| &r.config == *c) {
+            firsts.push(format!("{} ${:.3}", c, r.cost_usd));
+        }
+    }
+    if !firsts.is_empty() {
+        md.push_str(&format!(
+            "- First session of each configuration, which also writes its prompt prefix to the \
+             cache (once per hour of inactivity in real use): {}\n",
+            firsts.join(" · ")
         ));
     }
     md.push_str("\n## Per task\n\n| Task | Config | OK | Cost | New tokens | Total tokens | Tool calls | Turns |\n|---|---|---|---|---|---|---|---|\n");
