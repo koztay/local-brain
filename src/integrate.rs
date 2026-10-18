@@ -164,10 +164,9 @@ pub fn repair_stale(exe: &str) -> Vec<String> {
         if bins.is_empty() {
             continue; // set up with --no-agent
         }
-        let stale = bins.iter().any(|b| b != exe && !Path::new(b).exists());
-        // A newer local-brain may add hooks or change the CLAUDE.md section.
-        let outdated = !ClaudeCode::is_current(&project);
-        if !stale && !outdated {
+        if !needs_refresh(&bins, exe, |b| Path::new(b).exists(), || {
+            ClaudeCode::is_current(&project)
+        }) {
             continue;
         }
         match ClaudeCode.install(&project, exe) {
@@ -183,6 +182,22 @@ pub fn repair_stale(exe: &str) -> Vec<String> {
         }
     }
     msgs
+}
+
+/// Whether `exe` should re-install a project's integration: when a binary it points at is gone
+/// (stale), or when it points at `exe` itself and is outdated. A newer local-brain may add hooks
+/// or change the CLAUDE.md section — but only the project's own binary refreshes it, otherwise
+/// running a dev build (or a second install) anywhere would silently re-point the user's
+/// sessions at it.
+fn needs_refresh(
+    bins: &[String],
+    exe: &str,
+    exists: impl Fn(&str) -> bool,
+    is_current: impl FnOnce() -> bool,
+) -> bool {
+    let stale = bins.iter().any(|b| b != exe && !exists(b));
+    let points_here = bins.iter().all(|b| b == exe || b == "local-brain");
+    stale || (points_here && !is_current())
 }
 
 /// Every hook this version installs, as (event, settings entry).
@@ -474,15 +489,21 @@ impl Agent for ClaudeCode {
     fn check(&self, project: &Project, exe: &str) -> Vec<Check> {
         let mut out = Vec::new();
         match Self::mcp_registered(project) {
-            Some(cmd) => out.push(Check {
-                ok: Path::new(&cmd).exists() || cmd == "local-brain",
-                label: "MCP server registered".into(),
-                detail: if Path::new(&cmd).exists() {
-                    cmd
-                } else {
-                    format!("{} (binary missing — re-run `local-brain init`)", cmd)
-                },
-            }),
+            Some(cmd) => {
+                let exists = Path::new(&cmd).exists() || cmd == "local-brain";
+                let here = cmd == exe || cmd == "local-brain";
+                out.push(Check {
+                    ok: exists && here,
+                    label: "MCP server registered".into(),
+                    detail: if !exists {
+                        format!("{} (binary missing — re-run `local-brain init`)", cmd)
+                    } else if !here {
+                        format!("{} (another binary than {} — re-run `local-brain init`)", cmd, exe)
+                    } else {
+                        cmd
+                    },
+                })
+            }
             None => out.push(Check {
                 ok: false,
                 label: "MCP server registered".into(),
@@ -558,6 +579,21 @@ impl Agent for Codex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_registered_binary_refreshes_an_integration() {
+        let brew = "/opt/homebrew/bin/local-brain";
+        let bins = vec![brew.to_string()];
+        let dev = "/src/local-brain/target/debug/local-brain";
+        let exists = |_: &str| true;
+        // A dev build must not take over an outdated integration that belongs to Homebrew.
+        assert!(!needs_refresh(&bins, dev, exists, || false));
+        // Homebrew's own binary refreshes it after an upgrade.
+        assert!(needs_refresh(&bins, brew, exists, || false));
+        assert!(!needs_refresh(&bins, brew, exists, || true));
+        // A binary that disappeared is repaired by whoever runs next.
+        assert!(needs_refresh(&bins, dev, |_| false, || true));
+    }
 
     #[test]
     fn hook_binary_parsing() {

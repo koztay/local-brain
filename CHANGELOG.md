@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- Running a second local-brain binary (a development build, another install) in a project
+  re-pointed that project's hooks and MCP server at it whenever the integration looked outdated
+  to it, so Claude Code sessions silently ran that binary. Only the binary a project is
+  registered with refreshes its integration now; a binary that disappeared is still repaired by
+  whichever one runs next. `doctor` also flags an MCP registration that points at another
+  binary (it only checked that the file exists).
+
 ## [0.1.8] - 2026-10-18
 
 ### Changed
