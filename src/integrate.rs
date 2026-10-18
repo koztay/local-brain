@@ -164,9 +164,12 @@ pub fn repair_stale(exe: &str) -> Vec<String> {
         if bins.is_empty() {
             continue; // set up with --no-agent
         }
-        if !needs_refresh(&bins, exe, |b| Path::new(b).exists(), || {
-            ClaudeCode::is_current(&project)
-        }) {
+        if !needs_refresh(
+            &bins,
+            exe,
+            |b| Path::new(b).exists(),
+            || ClaudeCode::is_current(&project),
+        ) {
             continue;
         }
         match ClaudeCode.install(&project, exe) {
@@ -498,7 +501,10 @@ impl Agent for ClaudeCode {
                     detail: if !exists {
                         format!("{} (binary missing — re-run `local-brain init`)", cmd)
                     } else if !here {
-                        format!("{} (another binary than {} — re-run `local-brain init`)", cmd, exe)
+                        format!(
+                            "{} (another binary than {} — re-run `local-brain init`)",
+                            cmd, exe
+                        )
                     } else {
                         cmd
                     },

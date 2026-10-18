@@ -94,15 +94,13 @@ pub fn handle(event: &str, v: &Value) -> Result<Option<Value>> {
         ("session-start", _) if cfg.hooks.session_brief => {
             session_start(&project, &cfg, &store, &session)
         }
-        ("user-prompt-submit", _) if cfg.hooks.prompt_context => {
-            prompt_context(
-                &project,
-                &cfg,
-                &store,
-                &session,
-                v["prompt"].as_str().unwrap_or(""),
-            )
-        }
+        ("user-prompt-submit", _) if cfg.hooks.prompt_context => prompt_context(
+            &project,
+            &cfg,
+            &store,
+            &session,
+            v["prompt"].as_str().unwrap_or(""),
+        ),
         ("stop", _) if cfg.hooks.session_memory => {
             remember_pending(&store, &session, v["transcript_path"].as_str())?;
             Ok(None)
@@ -982,12 +980,20 @@ fn prompt_identifiers(prompt: &str) -> Vec<(String, bool)> {
         let inner_upper = w.chars().skip(1).any(|c| c.is_ascii_uppercase());
         let lower = w.chars().any(|c| c.is_ascii_lowercase());
         (w.contains('_') && w.chars().any(|c| c.is_alphanumeric()))
-            || (w.contains('.') && !w.ends_with('.') && w.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false))
+            || (w.contains('.')
+                && !w.ends_with('.')
+                && w.chars()
+                    .next()
+                    .map(|c| c.is_ascii_uppercase())
+                    .unwrap_or(false))
             || (inner_upper && lower)
     };
     let mut out: Vec<(String, bool)> = Vec::new();
     let mut push = |s: &str, ticked: bool| {
-        let s = s.trim().trim_end_matches("()").trim_matches(|c: char| c == ',' || c == '.' || c == ';' || c == ':');
+        let s = s
+            .trim()
+            .trim_end_matches("()")
+            .trim_matches(|c: char| c == ',' || c == '.' || c == ';' || c == ':');
         if s.chars().count() >= 2 && !out.iter().any(|(o, _)| o == s) && out.len() < 6 {
             out.push((s.to_string(), ticked));
         }
@@ -1023,7 +1029,9 @@ fn resolve_identifiers(store: &Store, ids: &[(String, bool)]) -> Result<Vec<Name
         let mut defs = store.symbols_best(id)?;
         if defs.is_empty() && *ticked {
             // `Parser.parse` → parse, preferably inside Parser.
-            if let Some((parent, member)) = id.rsplit_once('.').filter(|(p, m)| ident(p) && ident(m)) {
+            if let Some((parent, member)) =
+                id.rsplit_once('.').filter(|(p, m)| ident(p) && ident(m))
+            {
                 let all = store.symbols_best(member)?;
                 let inside: Vec<_> = all
                     .iter()
@@ -1036,10 +1044,12 @@ fn resolve_identifiers(store: &Store, ids: &[(String, bool)]) -> Result<Vec<Name
         if defs.is_empty() {
             continue;
         }
-        if out
-            .iter()
-            .any(|n| n.defs.first().map(|d| d.name == defs[0].name).unwrap_or(false))
-        {
+        if out.iter().any(|n| {
+            n.defs
+                .first()
+                .map(|d| d.name == defs[0].name)
+                .unwrap_or(false)
+        }) {
             continue;
         }
         defs.sort_by_key(|s| (is_test_path(&s.path), s.path.clone(), s.start_line));
@@ -1123,7 +1133,10 @@ fn render_symbols(project: &Project, named: &[Named], want_callers: bool, budget
             }
         }
         if n.defs.len() > 3 {
-            let line = format!("  (+{} more definitions named the same)\n", n.defs.len() - 3);
+            let line = format!(
+                "  (+{} more definitions named the same)\n",
+                n.defs.len() - 3
+            );
             if fits(&out, &line) {
                 out.push_str(&line);
             }
@@ -1196,7 +1209,12 @@ fn short_source(project: &Project, rel: &str, start: i64, end: i64) -> Option<St
         .unwrap_or(0);
     let body: Vec<String> = lines
         .iter()
-        .map(|l| format!("    {}", util::clip(l.get(indent..).unwrap_or("").trim_end(), 160)))
+        .map(|l| {
+            format!(
+                "    {}",
+                util::clip(l.get(indent..).unwrap_or("").trim_end(), 160)
+            )
+        })
         .collect();
     let src = body.join("\n");
     if src.len() > 900 {
@@ -1302,7 +1320,11 @@ fn render_paths(
     for p in paths {
         let room = ((budget - util::tokens(out)) * 4).max(200) as usize;
         if let Some((_, text, model)) = store.doc(p)? {
-            let kind = if p.to_lowercase().ends_with(".pdf") { "PDF" } else { "image" };
+            let kind = if p.to_lowercase().ends_with(".pdf") {
+                "PDF"
+            } else {
+                "image"
+            };
             // A Read of this file in this session then returns the original, not this again.
             store.record_denial(session, &format!("noted:{}", p))?;
             // Images get the gist only: Claude's own look at an image costs ~50–1,600 tokens
@@ -1365,7 +1387,13 @@ fn prompt_context(
     }
     let budget = cfg.hooks.prompt_context_tokens.max(150);
     let done = |out: String| -> Result<Option<Value>> {
-        store.record_metric("hook", "prompt_context", 0, util::tokens(&out), Some(session))?;
+        store.record_metric(
+            "hook",
+            "prompt_context",
+            0,
+            util::tokens(&out),
+            Some(session),
+        )?;
         Ok(Some(json!({
             "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": out}
         })))
@@ -1590,10 +1618,16 @@ mod tests {
             "Where is `createSafeFetch` defined, and who calls listMyRsvps or `Parser.parse()`? The admin page is slow.",
         );
         let names: Vec<&str> = ids.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["createSafeFetch", "Parser.parse", "listMyRsvps"]);
-        assert!(prompt_identifiers("Summarize `docs/brand/preview.png`")
-            .iter()
-            .all(|(n, _)| n.contains('/')), "paths are left to prompt_paths");
+        assert_eq!(
+            names,
+            vec!["createSafeFetch", "Parser.parse", "listMyRsvps"]
+        );
+        assert!(
+            prompt_identifiers("Summarize `docs/brand/preview.png`")
+                .iter()
+                .all(|(n, _)| n.contains('/')),
+            "paths are left to prompt_paths"
+        );
         assert!(ids[0].1 && !ids[2].1, "backticks are remembered");
         assert!(prompt_identifiers("improve the admin panel pages").is_empty());
         assert!(asks_for_callers("Which files call `listMyRsvps`?"));

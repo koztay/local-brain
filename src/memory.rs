@@ -249,8 +249,17 @@ pub fn first_sentences(text: &str, max_chars: usize) -> String {
     let mut t = flat.trim();
     let lower = t.to_lowercase();
     const FILLER: &[&str] = &[
-        "okay", "ok,", "ok.", "sure", "here's", "here is", "here’s", "certainly", "below is",
-        "alright", "great",
+        "okay",
+        "ok,",
+        "ok.",
+        "sure",
+        "here's",
+        "here is",
+        "here’s",
+        "certainly",
+        "below is",
+        "alright",
+        "great",
     ];
     if FILLER.iter().any(|f| lower.starts_with(f)) {
         // Drop the lead-in: up to the first colon, or the first sentence, whichever is first.
